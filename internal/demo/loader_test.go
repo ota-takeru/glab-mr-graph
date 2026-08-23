@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/orangain/gh-pr-graph/internal/graph"
+	"github.com/ota-takeru/glab-mr-graph/internal/graph"
 )
 
 func TestLoadProvidesScreenshotScenario(t *testing.T) {
@@ -14,8 +14,6 @@ func TestLoadProvidesScreenshotScenario(t *testing.T) {
 	}
 	prs, repos, branches := 0, 0, 0
 	relations := map[string]int{}
-	reReviewPRs := map[int]bool{}
-	pendingReviewPR := 0
 	for _, node := range result.Nodes {
 		if node.Kind == "repository" {
 			repos++
@@ -27,12 +25,6 @@ func TestLoadProvidesScreenshotScenario(t *testing.T) {
 		} else if node.Kind == "pullRequest" {
 			prs++
 			relations[node.PR.Relation]++
-			if node.PR.ReReviewRequested {
-				reReviewPRs[node.PR.Number] = true
-			}
-			if node.PR.ViewerPendingReview {
-				pendingReviewPR = node.PR.Number
-			}
 		}
 	}
 	if repos != 2 || prs != 5 {
@@ -52,11 +44,5 @@ func TestLoadProvidesScreenshotScenario(t *testing.T) {
 	}
 	if relations["mine"] != 1 || relations["assigned"] != 1 || relations["review-requested"] != 2 || relations["other"] != 1 {
 		t.Fatalf("relations = %+v", relations)
-	}
-	if !reReviewPRs[217] || !reReviewPRs[221] {
-		t.Fatalf("re-review PRs = %+v, want 217 and 221", reReviewPRs)
-	}
-	if pendingReviewPR != 221 {
-		t.Fatalf("pending-review PR = %d, want 221", pendingReviewPR)
 	}
 }

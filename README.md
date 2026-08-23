@@ -1,164 +1,108 @@
-<h1>
-  <img src="internal/server/web/logo.svg" width="40" alt="" align="absmiddle">
-  gh pr-graph
-</h1>
+# glab-mr-graph
 
-[![Latest release](https://img.shields.io/github/v/release/orangain/gh-pr-graph?label=release)](https://github.com/orangain/gh-pr-graph/releases/latest)
+`glab-mr-graph` turns GitLab Merge Requests that need your attention into one
+local visual workspace. It collects open MRs you authored, were assigned, or
+were asked to review, then follows exact source/target project and branch
+relationships to show stacked work across projects.
 
-`gh pr-graph` turns the pull requests that need your attention into one visual workspace. Run one command to see every open PR you authored, were assigned to, or were asked to review—across repositories—without assembling filters or checking separate GitHub pages.
+![MR Graph showing related merge requests across projects](docs/images/screenshot.png)
 
-![PR Graph showing related pull requests across repositories](docs/images/screenshot.png)
-
-As AI makes it easier to develop multiple changes in parallel, stacked pull requests are becoming larger and more common. A flat PR list hides which change depends on which. `gh pr-graph` follows base and head branches recursively and draws those relationships as a directed graph, making the review order, downstream work, and the path back to each repository immediately visible.
-
-Color-coded ownership and compact review, CI, conflict, and draft signals help you decide what needs action next. A re-review cue highlights fixes waiting on your next pass, so completed changes do not sit blocked on a quick follow-up. Merged PRs included in a change remain available in collapsible context, while automatic refresh keeps the workspace current. Everything runs locally through your authenticated `gh` CLI; GitHub credentials are never passed to the browser.
+The project is a GitLab-oriented fork of
+[`orangain/gh-pr-graph`](https://github.com/orangain/gh-pr-graph). The graph
+layout and local server retain the upstream implementation where that keeps
+the behavior stable; the provider, API mapping, UI wording, and release
+artifacts are GitLab-specific.
 
 ## Requirements
 
-- [GitHub CLI (`gh`)](https://cli.github.com/), authenticated with `gh auth login`
+- [GitLab CLI (`glab`)](https://gitlab.com/gitlab-org/cli), authenticated with
+  `glab auth login`
+- Go 1.23 or newer when building from source
 
-## Install
+The authenticated `glab` configuration supplies the token for GitLab.com or a
+self-managed GitLab instance. Tokens and API responses are never passed to
+the browser or written to disk.
 
-```sh
-gh extension install orangain/gh-pr-graph
-```
+## Install and run
 
-Upgrade later with:
-
-```sh
-gh extension upgrade pr-graph
-```
-
-## Usage
-
-Start the local server and open the PR graph in your browser:
+Download a release binary named `glab-mr-graph`, or build it locally:
 
 ```sh
-gh pr-graph
+make build
+./glab-mr-graph
 ```
 
-The server only listens on `127.0.0.1`. Press Ctrl-C in the terminal to stop it.
-
-Options:
+The server listens only on `127.0.0.1` and opens the graph in your browser.
+Press Ctrl-C to stop it.
 
 ```text
 --no-open          print the URL without opening a browser
 --port 8080        override the preferred local port (8787)
---hostname HOST    use a GitHub Enterprise hostname
+--hostname HOST    use a GitLab.com or self-managed GitLab hostname
 ```
 
-### Using the graph
+For example:
+
+```sh
+./glab-mr-graph --hostname gitlab.example.com --no-open
+```
 
 The Authored, Assigned, and Review requested filters are OR conditions. The
-search field adds a fourth OR condition using GitHub PR search syntax; clear
-all three filters to use only that query. `Show bots` is a local display filter
-and does not run the search again.
+search field adds a fourth OR condition and searches MR titles and
+descriptions. Clear all three relationship filters to use only the text
+search.
 
-The graph flows from a base on the left toward PRs stacked on it. A repository
-node represents its default branch. When a stack cannot be traced back to that
-branch, it starts at a branch node connected to the repository by a dashed
-edge.
+MR node backgrounds show why an MR is in the workspace: blue means authored,
+cyan means assigned, green means review requested, and gray means related
+stack context. Draft/ready state, approval counts, pipeline status, and merge
+conflicts are shown independently. The UI is read-only in this first GitLab
+version; Included MR history, pending-review comments, and re-review markers
+are intentionally disabled.
 
-PR node backgrounds show why a PR is in your workspace:
+## Demo mode
 
-| PR node color | Meaning |
-| --- | --- |
-| Blue | Authored by you |
-| Cyan | Assigned to you |
-| Green | Your review is requested |
-| Gray | Related context discovered while following the stack |
+Use the built-in fixture data to work on the UI without querying GitLab:
 
-When a PR matches more than one category, authored takes precedence over
-assigned, which takes precedence over review requested. A thick border means
-the PR is ready for review; a thin border and the draft pull-request icon mean
-it is still a draft.
+```sh
+GH_PR_GRAPH_DEMO=1 ./glab-mr-graph
+```
 
-`Reviews n/N approved` counts approvals against requested reviewers. The
-discussion marker means you have an unsubmitted review; it takes precedence
-over the orange sync marker for a PR updated and sent back after your previous
-review.
-
-`Included PRs` are merged PRs detected in the containing PR's commit history,
-not separate graph nodes.
+Demo mode is enabled only through `GH_PR_GRAPH_DEMO`; it is not a CLI option.
 
 ## Development
-
-Development requires Go 1.23 or newer.
-See [DESIGN.md](DESIGN.md) for the architecture and design decisions.
-
-### Build from source
 
 ```sh
 make test
 make build
-./gh-pr-graph
 ```
 
-For local extension development:
+The provider lives in `internal/gitlab`. It invokes `glab api --paginate`,
+deduplicates global MR IDs across the three relationship searches, hydrates
+MR details and approvals, and keeps a process-local project cache. The
+command runner is injectable so API fixtures can be tested without a token.
 
-```sh
-make build
-gh extension install .
-gh pr-graph
-```
+Stack discovery is breadth-first and bounded to 500 MRs and 20 levels. A
+relationship is accepted only when the project ID and branch name both match;
+same-named branches in forks cannot create an edge.
 
-### Demo mode
+For design decisions and data-flow limits, see [DESIGN.md](DESIGN.md).
 
-Use the built-in mock pull requests to work on the UI or capture screenshots
-without querying GitHub for pull request data:
+## Tracing
 
-```sh
-GH_PR_GRAPH_DEMO=1 ./gh-pr-graph
-```
-
-Demo mode is intentionally enabled only through the `GH_PR_GRAPH_DEMO`
-environment variable and does not appear as a command-line option.
-
-### Inspect traces locally
-
-Set `GH_PR_GRAPH_TRACE_OTEL=1` to export traces to
+Set `GH_PR_GRAPH_TRACE_OTEL=1` to export optional OpenTelemetry traces to
 `http://localhost:4318/v1/traces`. Set the variable to an explicit collector
-URL to use a different endpoint; the `/v1/traces` path is added when the URL
-has no path, for example `GH_PR_GRAPH_TRACE_OTEL=http://localhost:4318`.
-The graph and Included PR API requests are root spans with
-child spans for PR search, stacked PR discovery, commit inspection, and every
-`gh api graphql` command. Command spans include the executed arguments, exit
-code, duration, and error status. Trace delivery is asynchronous, batched, and
-best-effort, so an unavailable collector does not interrupt the application.
+URL to use a different endpoint. Tracing is best effort and does not include
+API response bodies or tokens.
 
-Start the included Jaeger collector and UI:
+## Releases
 
-```sh
-docker compose up -d
-```
+GitHub Actions runs JavaScript checks, tests, vet, and cross-platform builds.
+User-facing changes are recorded under `Unreleased` in
+[CHANGELOG.md](CHANGELOG.md). Release preparation follows the upstream
+workflow and produces artifacts based on the `glab-mr-graph` binary name.
 
-Run the extension with tracing enabled, then load or refresh the PR graph:
+## License and attribution
 
-```sh
-GH_PR_GRAPH_TRACE_OTEL=1 gh pr-graph
-```
-
-Open [http://localhost:16686](http://localhost:16686), select the
-`gh-pr-graph` service, and click **Find Traces**. `GET /api/v1/graph` covers PR
-search and stacked PR discovery, `POST /api/v1/inspect` covers commit inspection
-for one containing PR, and `POST /api/v1/included` covers its candidate detail query.
-
-Stop the local collector when finished:
-
-```sh
-docker compose down
-```
-
-## Releasing
-
-CI runs tests, vet, JavaScript syntax checking, release-note extraction tests, and a build on pushes to `main` and pull requests. User-facing changes are recorded under `Unreleased` in [CHANGELOG.md](CHANGELOG.md).
-
-To publish a version, create a `release/vX.Y.Z` branch and pull request that moves the `Unreleased` entries into a dated version section and updates the comparison links at the bottom of the changelog. Have a human review and merge that pull request into `main`. The merge automatically creates the matching annotated tag and publishes the GitHub Release; do not create the release tag before the pull request is merged.
-
-The release workflow only accepts merged internal release pull requests; pushing a version tag manually does not publish a release. It verifies and extracts the matching changelog section, creates the annotated tag on the merge commit, cross-compiles supported binaries, creates the GitHub Release, publishes the extracted notes, uploads correctly named assets, and generates build provenance attestations. A malformed release branch name or missing or empty version section fails the release. The workflow needs the repository's default `GITHUB_TOKEN` with the permissions declared in the workflow; no additional secret is required.
-
-For discoverability, set the repository topic `gh-extension` after publishing it.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+This project is MIT licensed. See [LICENSE](LICENSE). It is derived from
+[`orangain/gh-pr-graph`](https://github.com/orangain/gh-pr-graph), also MIT
+licensed; the upstream copyright and license notice are retained.

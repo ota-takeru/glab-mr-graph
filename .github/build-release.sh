@@ -19,5 +19,5 @@ for platform in "${platforms[@]}"; do
   fi
   GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build \
     -trimpath -ldflags="-s -w -X main.version=$version" \
-    -o "$output" ./cmd/gh-pr-graph
+    -o "$output" ./cmd/glab-mr-graph
 done

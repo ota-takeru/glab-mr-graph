@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/orangain/gh-pr-graph/internal/graph"
+	"github.com/ota-takeru/glab-mr-graph/internal/graph"
 )
 
 type fakeLoader struct{ options graph.SearchOptions }

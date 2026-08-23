@@ -3,33 +3,33 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>PR Graph</title>
+  <title>MR Graph</title>
   <link rel="icon" href="/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <header>
-    <a id="brand" class="brand" href="https://github.com/orangain/gh-pr-graph" target="_blank" rel="noreferrer" aria-label="PR Graph on GitHub"><img src="/logo.svg" alt=""><span>PR Graph</span></a>
+    <a id="brand" class="brand" href="https://github.com/ota-takeru/glab-mr-graph" target="_blank" rel="noreferrer" aria-label="MR Graph on GitHub"><img src="/logo.svg" alt=""><span>MR Graph</span></a>
     <form id="search-form">
       <label><input id="scope-authored" type="checkbox" checked> Authored</label>
       <label><input id="scope-assigned" type="checkbox" checked> Assigned</label>
       <label><input id="scope-review" type="checkbox" checked> Review requested</label>
-      <input id="search" type="search" aria-label="Additional GitHub PR search" placeholder="Add another OR query…">
+      <input id="search" type="search" aria-label="Additional GitLab MR search" placeholder="Search title or description…">
       <button type="submit">Search</button>
     </form>
     <button id="refresh" type="button" title="Refresh now">↻</button>
     <label class="auto"><input id="auto" type="checkbox" checked> Auto-refresh</label>
     <span id="updated" aria-live="polite"></span>
   </header>
-  <div id="progress" class="progress" role="progressbar" aria-label="Loading pull requests" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
+  <div id="progress" class="progress" role="progressbar" aria-label="Loading merge requests" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
     <div class="progress-bar"></div>
-    <span>Loading pull requests…</span>
+    <span>Loading merge requests…</span>
   </div>
   <label class="graph-options" hidden><input id="show-bots" type="checkbox" checked> Show bots</label>
   <div id="warnings" role="status"></div>
   <main id="viewport">
     <div id="canvas"><svg id="edges" aria-hidden="true"></svg><div id="lanes"></div></div>
-    <div id="empty" hidden>No pull requests found. Try a different search.</div>
+    <div id="empty" hidden>No merge requests found. Try a different search.</div>
   </main>
   <div id="error" role="alert" hidden></div>
   <script src="/refresh.js" defer></script>

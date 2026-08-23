@@ -25,8 +25,11 @@ func Build(prs []*PullRequest, warnings []string) Result {
 		head[key] = append(head[key], pr)
 		repo := repos[pr.RepositoryID]
 		if repo == nil {
-			repo = &Repository{ID: pr.RepositoryID, NameWithOwner: pr.Repository, DefaultBranch: pr.DefaultBranch}
+			repo = &Repository{ID: pr.RepositoryID, NameWithOwner: pr.Repository, DefaultBranch: pr.DefaultBranch, Provider: pr.Provider}
 			repos[pr.RepositoryID] = repo
+		}
+		if repo.Provider == "" {
+			repo.Provider = pr.Provider
 		}
 		if pr.RepositoryURL != "" {
 			repo.URL = pr.RepositoryURL
@@ -46,7 +49,7 @@ func Build(prs []*PullRequest, warnings []string) Result {
 				branches[key] = branch
 			}
 			if branch.URL == "" {
-				branch.URL = branchURL(pr.RepositoryURL, pr.BaseRefName)
+				branch.URL = branchURL(pr.RepositoryURL, pr.Provider, pr.BaseRefName)
 			}
 		} else {
 			ranks[pr.ID] = 1
@@ -126,7 +129,7 @@ func refKey(repoID, ref string) string { return repoID + "\x00" + ref }
 
 func branchNodeID(repoID, ref string) string { return "branch:" + repoID + ":" + ref }
 
-func branchURL(repositoryURL, ref string) string {
+func branchURL(repositoryURL, provider, ref string) string {
 	if repositoryURL == "" || ref == "" {
 		return ""
 	}
@@ -134,7 +137,11 @@ func branchURL(repositoryURL, ref string) string {
 	for i := range parts {
 		parts[i] = url.PathEscape(parts[i])
 	}
-	return strings.TrimRight(repositoryURL, "/") + "/tree/" + strings.Join(parts, "/")
+	suffix := "/tree/"
+	if provider == "gitlab" {
+		suffix = "/-/tree/"
+	}
+	return strings.TrimRight(repositoryURL, "/") + suffix + strings.Join(parts, "/")
 }
 
 func hasDifferentPR(prs []*PullRequest, id string) bool {

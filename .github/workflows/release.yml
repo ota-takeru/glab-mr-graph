@@ -48,7 +48,7 @@ jobs:
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "gh-pr-graph ${TAG#v}"
+          git tag -a "$TAG" -m "glab-mr-graph ${TAG#v}"
           git push origin "$TAG"
       - uses: cli/gh-extension-precompile@v2
         with:

@@ -193,8 +193,8 @@ func (e *Exporter) export(spans []spanData) {
 		encodedSpans = append(encodedSpans, encodedSpan)
 	}
 	payload := map[string]any{"resourceSpans": []any{map[string]any{
-		"resource":   map[string]any{"attributes": encodeAttributes(Attributes{"service.name": "gh-pr-graph"})},
-		"scopeSpans": []any{map[string]any{"scope": map[string]any{"name": "github.com/orangain/gh-pr-graph"}, "spans": encodedSpans}},
+		"resource":   map[string]any{"attributes": encodeAttributes(Attributes{"service.name": "glab-mr-graph"})},
+		"scopeSpans": []any{map[string]any{"scope": map[string]any{"name": "github.com/ota-takeru/glab-mr-graph"}, "spans": encodedSpans}},
 	}}}
 	body, err := json.Marshal(payload)
 	if err != nil {

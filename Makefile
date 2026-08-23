@@ -4,10 +4,10 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || printf de
 LDFLAGS := -X main.version=$(VERSION)
 
 build:
-	go build -ldflags "$(LDFLAGS)" -o gh-pr-graph ./cmd/gh-pr-graph
+	go build -ldflags "$(LDFLAGS)" -o glab-mr-graph ./cmd/glab-mr-graph
 
 test:
 	go test ./...
 
 run:
-	go run -ldflags "$(LDFLAGS)" ./cmd/gh-pr-graph
+	go run -ldflags "$(LDFLAGS)" ./cmd/glab-mr-graph

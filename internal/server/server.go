@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/orangain/gh-pr-graph/internal/graph"
-	"github.com/orangain/gh-pr-graph/internal/oteltrace"
+	"github.com/ota-takeru/glab-mr-graph/internal/graph"
+	"github.com/ota-takeru/glab-mr-graph/internal/oteltrace"
 )
 
 //go:embed web/*
@@ -178,7 +178,13 @@ func (s *Server) graphStream(w http.ResponseWriter, r *http.Request, loader prog
 			collected++
 		}
 	}
-	_ = encoder.Encode(map[string]any{"type": "progress", "current": 0, "total": 1, "phase": "Inspecting pull request commits", "percent": 65, "collected": collected})
+	// GitLab's first version is intentionally read-only and does not inspect
+	// merge commits for Included MRs. Keep the legacy inspection stream for
+	// compatible loaders, but do not make the GitLab client pretend to support
+	// that feature.
+	if _, ok := s.loader.(inspectLoader); ok {
+		_ = encoder.Encode(map[string]any{"type": "progress", "current": 0, "total": 1, "phase": "Inspecting pull request commits", "percent": 65, "collected": collected})
+	}
 	_ = encoder.Encode(map[string]any{"type": "result", "result": result})
 	return nil
 }
@@ -294,9 +300,9 @@ func progressPercent(current, total int, phase string) int {
 		ratio = 1
 	}
 	switch phase {
-	case "Searching pull requests":
+	case "Searching pull requests", "Searching merge requests":
 		return int(ratio * 20)
-	case "Discovering stacked pull requests":
+	case "Discovering stacked pull requests", "Discovering stacked merge requests":
 		return 20 + int(ratio*45)
 	case "Inspecting included pull requests":
 		return 65 + int(ratio*35)

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/orangain/gh-pr-graph/internal/graph"
+	"github.com/ota-takeru/glab-mr-graph/internal/graph"
 )
 
 type Loader struct{}
@@ -43,45 +43,21 @@ func (l *Loader) LoadProgress(_ context.Context, options graph.SearchOptions, pr
 		}
 	}
 	if progress != nil {
-		progress(1, 1, "Searching pull requests", len(prs))
-		progress(1, 1, "Discovering stacked pull requests", len(prs))
+		progress(1, 1, "Searching merge requests", len(prs))
+		progress(1, 1, "Discovering stacked merge requests", len(prs))
 	}
 	return graph.Build(prs, nil), nil
 }
 
-func (l *Loader) InspectPullRequest(_ context.Context, pr *graph.PullRequest) (graph.IncludedUpdate, error) {
-	included := []graph.IncludedPullRequest{}
-	if pr.ID == "authored" {
-		included = append(included, graph.IncludedPullRequest{Number: 88})
-	}
-	return graph.IncludedUpdate{PullRequestID: pr.ID, IncludedPullRequests: included}, nil
-}
-
-func (l *Loader) LoadIncluded(_ context.Context, prs []*graph.PullRequest, progress func(int, int, string)) ([]graph.IncludedUpdate, error) {
-	updates := []graph.IncludedUpdate{}
-	for _, pr := range prs {
-		included := pr.IncludedPRs
-		if pr.ID == "authored" && len(included) > 0 {
-			mergedAt := time.Date(2026, time.July, 30, 9, 30, 0, 0, time.UTC)
-			included = []graph.IncludedPullRequest{{ID: "included-88", Number: 88, Title: "Add reusable authentication primitives", URL: "https://github.com/acme/atlas/pull/88", Author: graph.User{Login: "orangain"}, MergedAt: &mergedAt}}
-		}
-		updates = append(updates, graph.IncludedUpdate{PullRequestID: pr.ID, IncludedPullRequests: included})
-	}
-	if progress != nil {
-		progress(1, 1, "Fetching included pull requests")
-	}
-	return updates, nil
-}
-
 func pullRequests() []*graph.PullRequest {
 	updated := time.Date(2026, time.August, 3, 10, 0, 0, 0, time.UTC)
-	user := graph.User{Login: "orangain", AvatarURL: "https://github.com/orangain.png?size=40"}
+	user := graph.User{Login: "ota-takeru", AvatarURL: "https://gitlab.com/uploads/-/system/user/avatar/1/avatar.png"}
 	prs := []*graph.PullRequest{
-		{ID: "authored", Number: 104, Title: "Ship the new command palette", URL: "https://github.com/acme/atlas/pull/104", UpdatedAt: updated, Author: user, RepositoryID: "atlas", Repository: "acme/atlas", RepositoryURL: "https://github.com/acme/atlas", DefaultBranch: "main", BaseRefName: "release/2026-q3", HeadRefName: "command-palette", HeadRepositoryID: "atlas", HeadRepository: "acme/atlas", ReviewDecision: "APPROVED", ReviewApproved: 2, ReviewTotal: 2, CIState: "SUCCESS", Mergeable: "MERGEABLE", Relation: "mine", Source: "search"},
-		{ID: "review-root", Number: 217, Title: "Introduce the agent workflow engine", URL: "https://github.com/acme/atlas/pull/217", UpdatedAt: updated, Author: graph.User{Login: "maya", AvatarURL: "https://github.com/identicons/maya.png"}, RepositoryID: "atlas", Repository: "acme/atlas", RepositoryURL: "https://github.com/acme/atlas", DefaultBranch: "main", BaseRefName: "main", HeadRefName: "agent-workflows", HeadRepositoryID: "atlas", HeadRepository: "acme/atlas", ReviewApproved: 1, ReviewTotal: 3, ReReviewRequested: true, CIState: "SUCCESS", Mergeable: "MERGEABLE", Relation: "review-requested", Source: "search"},
-		{ID: "review-child", Number: 221, Title: "Add parallel tool execution", URL: "https://github.com/acme/atlas/pull/221", UpdatedAt: updated, Author: graph.User{Login: "leo", AvatarURL: "https://github.com/identicons/leo.png"}, RepositoryID: "atlas", Repository: "acme/atlas", RepositoryURL: "https://github.com/acme/atlas", DefaultBranch: "main", BaseRefName: "agent-workflows", HeadRefName: "parallel-tools", HeadRepositoryID: "atlas", HeadRepository: "acme/atlas", ReviewApproved: 0, ReviewTotal: 2, ViewerPendingReview: true, ReReviewRequested: true, CIState: "PENDING", Mergeable: "MERGEABLE", Relation: "review-requested", Source: "downstream"},
-		{ID: "other-child", Number: 223, Title: "Persist agent execution history", URL: "https://github.com/acme/atlas/pull/223", IsDraft: true, UpdatedAt: updated, Author: graph.User{Login: "nora", AvatarURL: "https://github.com/identicons/nora.png"}, RepositoryID: "atlas", Repository: "acme/atlas", RepositoryURL: "https://github.com/acme/atlas", DefaultBranch: "main", BaseRefName: "agent-workflows", HeadRefName: "execution-history", HeadRepositoryID: "atlas", HeadRepository: "acme/atlas", ReviewApproved: 0, ReviewTotal: 1, CIState: "FAILURE", Mergeable: "CONFLICTING", Relation: "other", Source: "downstream"},
-		{ID: "assigned-bot", Number: 73, Title: "Bump OpenTelemetry dependencies", URL: "https://github.com/acme/beacon/pull/73", UpdatedAt: updated, Author: graph.User{Login: "dependabot[bot]", AvatarURL: "https://github.com/dependabot.png?size=40"}, IsBot: true, RepositoryID: "beacon", Repository: "acme/beacon", RepositoryURL: "https://github.com/acme/beacon", DefaultBranch: "main", BaseRefName: "main", HeadRefName: "dependabot/go-modules/otel", HeadRepositoryID: "beacon", HeadRepository: "acme/beacon", Assignees: []graph.User{user}, ReviewApproved: 0, ReviewTotal: 1, CIState: "SUCCESS", Mergeable: "MERGEABLE", Relation: "assigned", Source: "search"},
+		{ID: "authored", Number: 104, Title: "Ship the new command palette", URL: "https://gitlab.com/acme/atlas/-/merge_requests/104", UpdatedAt: updated, Author: user, RepositoryID: "atlas", Repository: "acme/atlas", RepositoryURL: "https://gitlab.com/acme/atlas", DefaultBranch: "main", BaseRefName: "release/2026-q3", HeadRefName: "command-palette", HeadRepositoryID: "atlas", HeadRepository: "acme/atlas", ReviewDecision: "APPROVED", ReviewApproved: 2, ReviewTotal: 2, CIState: "SUCCESS", Mergeable: "MERGEABLE", Relation: "mine", Source: "search"},
+		{ID: "review-root", Number: 217, Title: "Introduce the agent workflow engine", URL: "https://gitlab.com/acme/atlas/-/merge_requests/217", UpdatedAt: updated, Author: graph.User{Login: "maya", AvatarURL: "https://gitlab.com/uploads/-/system/user/avatar/2/avatar.png"}, RepositoryID: "atlas", Repository: "acme/atlas", RepositoryURL: "https://gitlab.com/acme/atlas", DefaultBranch: "main", BaseRefName: "main", HeadRefName: "agent-workflows", HeadRepositoryID: "atlas", HeadRepository: "acme/atlas", ReviewApproved: 1, ReviewTotal: 3, CIState: "SUCCESS", Mergeable: "MERGEABLE", Relation: "review-requested", Source: "search"},
+		{ID: "review-child", Number: 221, Title: "Add parallel tool execution", URL: "https://gitlab.com/acme/atlas/-/merge_requests/221", UpdatedAt: updated, Author: graph.User{Login: "leo", AvatarURL: "https://gitlab.com/uploads/-/system/user/avatar/3/avatar.png"}, RepositoryID: "atlas", Repository: "acme/atlas", RepositoryURL: "https://gitlab.com/acme/atlas", DefaultBranch: "main", BaseRefName: "agent-workflows", HeadRefName: "parallel-tools", HeadRepositoryID: "atlas", HeadRepository: "acme/atlas", ReviewApproved: 0, ReviewTotal: 2, CIState: "PENDING", Mergeable: "MERGEABLE", Relation: "review-requested", Source: "downstream"},
+		{ID: "other-child", Number: 223, Title: "Persist agent execution history", URL: "https://gitlab.com/acme/atlas/-/merge_requests/223", IsDraft: true, UpdatedAt: updated, Author: graph.User{Login: "nora", AvatarURL: "https://gitlab.com/uploads/-/system/user/avatar/4/avatar.png"}, RepositoryID: "atlas", Repository: "acme/atlas", RepositoryURL: "https://gitlab.com/acme/atlas", DefaultBranch: "main", BaseRefName: "agent-workflows", HeadRefName: "execution-history", HeadRepositoryID: "atlas", HeadRepository: "acme/atlas", ReviewApproved: 0, ReviewTotal: 1, CIState: "FAILURE", Mergeable: "CONFLICTING", Relation: "other", Source: "downstream"},
+		{ID: "assigned-bot", Number: 73, Title: "Bump OpenTelemetry dependencies", URL: "https://gitlab.com/acme/beacon/-/merge_requests/73", UpdatedAt: updated, Author: graph.User{Login: "dependabot[bot]", AvatarURL: "https://gitlab.com/uploads/-/system/user/avatar/5/avatar.png"}, IsBot: true, RepositoryID: "beacon", Repository: "acme/beacon", RepositoryURL: "https://gitlab.com/acme/beacon", DefaultBranch: "main", BaseRefName: "main", HeadRefName: "dependabot/go-modules/otel", HeadRepositoryID: "beacon", HeadRepository: "acme/beacon", Assignees: []graph.User{user}, ReviewApproved: 0, ReviewTotal: 1, CIState: "SUCCESS", Mergeable: "MERGEABLE", Relation: "assigned", Source: "search"},
 	}
 	for _, pr := range prs {
 		pr.BaseCommitSHA = "demo-base-" + pr.ID

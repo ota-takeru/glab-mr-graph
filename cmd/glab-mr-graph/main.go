@@ -9,13 +9,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/orangain/gh-pr-graph/internal/demo"
-	"github.com/orangain/gh-pr-graph/internal/github"
-	"github.com/orangain/gh-pr-graph/internal/oteltrace"
-	"github.com/orangain/gh-pr-graph/internal/server"
+	"github.com/ota-takeru/glab-mr-graph/internal/demo"
+	"github.com/ota-takeru/glab-mr-graph/internal/gitlab"
+	"github.com/ota-takeru/glab-mr-graph/internal/oteltrace"
+	"github.com/ota-takeru/glab-mr-graph/internal/server"
 )
 
-const projectURL = "https://github.com/orangain/gh-pr-graph"
+const projectURL = "https://github.com/ota-takeru/glab-mr-graph"
 
 var version = "dev"
 
@@ -25,7 +25,7 @@ func main() {
 	var hostname string
 	flag.IntVar(&port, "port", server.DefaultPort, "local server port (0 selects a free port)")
 	flag.BoolVar(&noOpen, "no-open", false, "do not open the browser")
-	flag.StringVar(&hostname, "hostname", "", "GitHub hostname (defaults to gh configuration)")
+	flag.StringVar(&hostname, "hostname", "", "GitLab hostname (defaults to glab configuration)")
 	flag.Parse()
 	portExplicit := false
 	flag.Visit(func(current *flag.Flag) {
@@ -34,16 +34,16 @@ func main() {
 		}
 	})
 	if flag.NArg() != 0 {
-		fmt.Fprintln(os.Stderr, "gh pr-graph: unexpected arguments:", flag.Args())
+		fmt.Fprintln(os.Stderr, "glab-mr-graph: unexpected arguments:", flag.Args())
 		os.Exit(2)
 	}
-	fmt.Printf("gh pr-graph %s\n%s\n", version, projectURL)
+	fmt.Printf("glab-mr-graph %s\n%s\n", version, projectURL)
 
-	client := github.New(hostname)
+	client := gitlab.New(hostname)
 	var loader server.Loader = client
 	if os.Getenv("GH_PR_GRAPH_DEMO") == "1" {
 		loader = demo.New()
-		fmt.Fprintln(os.Stderr, "gh pr-graph: GH_PR_GRAPH_DEMO enabled; using demo data")
+		fmt.Fprintln(os.Stderr, "glab-mr-graph: GH_PR_GRAPH_DEMO enabled; using demo data")
 	}
 	var exporter *oteltrace.Exporter
 	if endpoint, enabled := os.LookupEnv("GH_PR_GRAPH_TRACE_OTEL"); enabled {
@@ -53,11 +53,11 @@ func main() {
 		var err error
 		exporter, err = oteltrace.New(endpoint)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "gh pr-graph: invalid GH_PR_GRAPH_TRACE_OTEL:", err)
+			fmt.Fprintln(os.Stderr, "glab-mr-graph: invalid GH_PR_GRAPH_TRACE_OTEL:", err)
 			os.Exit(2)
 		}
 		client.Tracer = exporter
-		fmt.Fprintf(os.Stderr, "gh pr-graph: GH_PR_GRAPH_TRACE_OTEL enabled; exporting traces to %s\n", exporter.Endpoint())
+		fmt.Fprintf(os.Stderr, "glab-mr-graph: GH_PR_GRAPH_TRACE_OTEL enabled; exporting traces to %s\n", exporter.Endpoint())
 	}
 	app := server.New(loader)
 	app.SetVersion(version)
@@ -72,7 +72,7 @@ func main() {
 		address, err = app.StartPreferred(port)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "gh pr-graph:", err)
+		fmt.Fprintln(os.Stderr, "glab-mr-graph:", err)
 		os.Exit(1)
 	}
 	fmt.Println("Opened", address)

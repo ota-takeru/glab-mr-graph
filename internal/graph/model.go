@@ -26,6 +26,7 @@ type PullRequest struct {
 	RepositoryID        string                `json:"repositoryId"`
 	Repository          string                `json:"repository"`
 	RepositoryURL       string                `json:"repositoryUrl"`
+	Provider            string                `json:"provider,omitempty"`
 	DefaultBranch       string                `json:"defaultBranch"`
 	BaseRefName         string                `json:"baseRefName"`
 	HeadRefName         string                `json:"headRefName"`
@@ -68,6 +69,7 @@ type Repository struct {
 	NameWithOwner string `json:"nameWithOwner"`
 	URL           string `json:"url"`
 	DefaultBranch string `json:"defaultBranch"`
+	Provider      string `json:"provider,omitempty"`
 }
 
 type Edge struct {
