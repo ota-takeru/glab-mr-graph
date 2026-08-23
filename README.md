@@ -17,6 +17,8 @@ artifacts are GitLab-specific.
 
 - [GitLab CLI (`glab`)](https://gitlab.com/gitlab-org/cli), authenticated with
   `glab auth login`
+- Git for Windows when installing on Windows, with its `sh` on `PATH` (`glab`
+  runs shell aliases through `sh`)
 - Go 1.23 or newer when building from source
 
 The authenticated `glab` configuration supplies the token for GitLab.com or a
@@ -25,7 +27,54 @@ the browser or written to disk.
 
 ## Install and run
 
-Download a release binary named `glab-mr-graph`, or build it locally:
+The installer downloads the release binary into your user account and registers
+a managed `glab` shell alias. Review the linked installer before piping remote
+code into a shell. These commands become usable after the first GitLab version
+of this project is published in GitHub Releases; until then, build from source
+as shown below. On macOS, Linux, or FreeBSD:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ota-takeru/glab-mr-graph/main/scripts/install.sh | sh
+glab mr-graph
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/ota-takeru/glab-mr-graph/main/scripts/install.ps1 | iex
+glab mr-graph
+```
+
+The POSIX installer uses `$XDG_BIN_HOME`, or `~/.local/bin` when it is unset.
+The Windows installer uses `%LOCALAPPDATA%\glab-mr-graph\bin` and adds that exact
+directory to the user `PATH`. Override either location with
+`GLAB_MR_GRAPH_INSTALL_DIR`. Set `GLAB_MR_GRAPH_VERSION` to a published release
+tag matching `vX.Y.Z` to pin a version; the default is the latest release.
+Running the installer again upgrades the binary in place.
+
+The installer refuses to replace an existing `mr-graph` alias unless it exactly
+matches the alias managed for this installation. It downloads to a temporary
+file before replacing the binary, so a failed download leaves the installed
+version intact.
+
+To uninstall on macOS, Linux, or FreeBSD:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ota-takeru/glab-mr-graph/main/scripts/uninstall.sh | sh
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/ota-takeru/glab-mr-graph/main/scripts/uninstall.ps1 | iex
+```
+
+Uninstall removes only the managed alias and the binary at the configured
+install path. On Windows it also removes a `PATH` entry only when that entry was
+added by the installer. An unrelated `mr-graph` alias is preserved.
+
+You can also download a release asset named for the target platform, or build
+the standalone binary locally:
 
 ```sh
 make build
@@ -44,7 +93,7 @@ Press Ctrl-C to stop it.
 For example:
 
 ```sh
-./glab-mr-graph --hostname gitlab.example.com --no-open
+glab mr-graph --hostname gitlab.example.com --no-open
 ```
 
 The Authored, Assigned, and Review requested filters are OR conditions. The
@@ -76,6 +125,16 @@ Demo mode is enabled only through `GLAB_MR_GRAPH_DEMO`; it is not a CLI option.
 make test
 make build
 ```
+
+Installer tests use a fake `glab` and local release fixtures; they never need
+GitLab credentials or a network download:
+
+```sh
+bash scripts/install_test.sh
+pwsh -File scripts/install_test.ps1
+```
+
+`GLAB_MR_GRAPH_ASSET_PATH` supplies the local fixture binary for these tests.
 
 The provider lives in `internal/gitlab`. It invokes `glab api` with manual
 `per_page=100&page=N` pagination, stops each search spec at 500 items, and
@@ -118,7 +177,8 @@ encoded OTLP payload.
 
 ## Releases
 
-GitHub Actions runs JavaScript checks, tests, vet, and cross-platform builds.
+GitHub Actions runs JavaScript checks, tests, vet, cross-platform builds, and
+installer tests on Ubuntu and Windows.
 User-facing changes are recorded under `Unreleased` in
 [CHANGELOG.md](CHANGELOG.md). Release preparation follows the upstream
 workflow and produces artifacts based on the `glab-mr-graph` binary name.

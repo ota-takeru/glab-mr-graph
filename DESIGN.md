@@ -213,6 +213,29 @@ moduleとbinaryは `github.com/ota-takeru/glab-mr-graph` / `glab-mr-graph` と�
 GitHub Actionsは upstream のCI/release構成を保ち、release buildの出力先だけ
 GitLab版binary名へ変更する。MIT licenseとupstream linkをREADMEに明記する。
 
+GitHub向けupstreamの `gh extension install` に近い操作感として、POSIXの
+`scripts/install.sh` とWindows PowerShellの `scripts/install.ps1` を提供する。
+installerはOS/architectureに対応するGitHub Releaseのraw assetをユーザー領域へ
+downloadし、`glab alias set --shell mr-graph` で `glab mr-graph` を登録する。
+POSIXは `$XDG_BIN_HOME` または `$HOME/.local/bin`、Windowsは
+`%LOCALAPPDATA%\glab-mr-graph\bin` を既定とし、`GLAB_MR_GRAPH_INSTALL_DIR` で
+上書きできる。WindowsはGit for Windowsの `sh` をdownload前に必須確認し、install先を
+user PATHへ追加する。installerが追加したPATHだけをmarkerで識別してuninstall時に戻す。
+
+`GLAB_MR_GRAPH_VERSION` は既定の `latest` または厳密な `vX.Y.Z` を受け入れる。
+`GLAB_MR_GRAPH_ASSET_PATH` はnetworkを使わないfixture test専用のlocal asset override
+である。downloadはinstall先と同じdirectoryの一時fileへ完了してからbinaryを置換し、
+download失敗時は既存binaryを保持する。再実行は同じpathのbinaryをupgradeし、alias登録に
+失敗した場合もbackupしたbinaryへrollbackする。
+
+install/uninstallは `glab alias list` のcommandをinstallerが生成する値と完全一致で確認する。
+別用途の `mr-graph` aliasがある場合、installは衝突として停止し、uninstallはそのaliasを
+保持する。uninstallerが削除する実行fileは選択されたinstall directory直下の
+`glab-mr-graph`（Windowsは `.exe`）だけで、directoryや他のfileは再帰削除しない。
+Ubuntuではfake `glab` とlocal POSIX asset、Windowsではfake `glab` とlocal Windows assetを
+使ってalias、引数転送、latest/version pin、install directory override、upgrade、失敗時保持、
+衝突、uninstall、PATH追加・削除をCIで検証する。
+
 通常の変更では次を実行する。
 
 ```sh
@@ -222,6 +245,8 @@ go test ./...
 go vet ./...
 make test
 make build
+bash scripts/install_test.sh
+pwsh -File scripts/install_test.ps1
 ```
 
 fixture testでは、OR dedupe、検索・branch listの並列数と決定的merge、全MR一括
