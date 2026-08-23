@@ -85,7 +85,9 @@ Stack discovery is breadth-first and bounded to 500 MRs and 20 levels. A
 relationship is accepted only when the project ID and branch name both match;
 same-named branches in forks cannot create an edge.
 
-For design decisions and data-flow limits, see [DESIGN.md](DESIGN.md).
+For design decisions and data-flow limits, see [DESIGN.md](DESIGN.md). For a
+GitHub-to-GitLab comparison and current implementation boundaries, see
+[docs/github-gitlab-differences.md](docs/github-gitlab-differences.md).
 
 ## Tracing
 
