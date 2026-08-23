@@ -8,16 +8,79 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/ota-takeru/glab-mr-graph/internal/graph"
+	"github.com/ota-takeru/glab-mr-graph/internal/oteltrace"
 )
+
+type serverTraceRecord struct {
+	name  string
+	start oteltrace.Attributes
+	end   oteltrace.Attributes
+	err   error
+}
+
+type serverRecordingTracer struct {
+	mu    sync.Mutex
+	spans []*serverTraceRecord
+}
+
+type serverRecordingSpan struct {
+	tracer *serverRecordingTracer
+	span   *serverTraceRecord
+}
+
+func (t *serverRecordingTracer) Start(ctx context.Context, name string, _ oteltrace.SpanKind, attributes oteltrace.Attributes) (context.Context, oteltrace.Span) {
+	record := &serverTraceRecord{name: name, start: cloneServerTraceAttributes(attributes)}
+	t.mu.Lock()
+	t.spans = append(t.spans, record)
+	t.mu.Unlock()
+	return ctx, &serverRecordingSpan{tracer: t, span: record}
+}
+
+func (s *serverRecordingSpan) End(err error, attributes oteltrace.Attributes) {
+	s.tracer.mu.Lock()
+	s.span.err = err
+	s.span.end = cloneServerTraceAttributes(attributes)
+	s.tracer.mu.Unlock()
+}
+
+func cloneServerTraceAttributes(attributes oteltrace.Attributes) oteltrace.Attributes {
+	result := make(oteltrace.Attributes, len(attributes))
+	for key, value := range attributes {
+		result[key] = value
+	}
+	return result
+}
 
 type fakeLoader struct{ options graph.SearchOptions }
 
 type progressLoader struct{ fakeLoader }
+
+type stagedProgressLoader struct{ progressLoader }
+
+type flushRecorder struct {
+	*httptest.ResponseRecorder
+	snapshots []string
+}
+
+func (r *flushRecorder) Flush() {
+	r.ResponseRecorder.Flush()
+	r.snapshots = append(r.snapshots, r.Body.String())
+}
+
+func (f *stagedProgressLoader) LoadStages(_ context.Context, _ graph.SearchOptions, progress func(int, int, string, int), emit func(string, graph.Result)) (graph.Result, error) {
+	progress(1, 1, "Discovering stacked merge requests", 1)
+	topology := graph.Result{Nodes: []graph.Node{{ID: "topology-node", Kind: "pullRequest"}}}
+	complete := graph.Result{Nodes: []graph.Node{{ID: "complete-node", Kind: "pullRequest"}}}
+	emit("topology", topology)
+	emit("complete", complete)
+	return complete, nil
+}
 
 func (f *progressLoader) LoadProgress(_ context.Context, _ graph.SearchOptions, progress func(int, int, string, int)) (graph.Result, error) {
 	progress(1, 1, "Searching merge requests", 1)
@@ -53,6 +116,60 @@ func TestGraphHandler(t *testing.T) {
 	var result graph.Result
 	if err := json.NewDecoder(recorder.Body).Decode(&result); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestServerTraceDoesNotRecordPrivateRequestValues(t *testing.T) {
+	const secretQuery = "private-search-value"
+	const secretHost = "private.gitlab.example"
+	const secretID = "gitlab:mr:987"
+	tracer := &serverRecordingTracer{}
+	s := New(&fakeLoader{})
+	s.SetTracer(tracer)
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/graph?q="+secretQuery+"&branch=private-branch", nil)
+	request.Host = secretHost
+	s.graph(httptest.NewRecorder(), request)
+
+	tracer.mu.Lock()
+	records := append([]*serverTraceRecord(nil), tracer.spans...)
+	tracer.mu.Unlock()
+	if len(records) != 1 {
+		t.Fatalf("recorded spans = %d, want 1", len(records))
+	}
+	for _, record := range records {
+		encoded := fmt.Sprintf("%s %v %v %v", record.name, record.start, record.end, record.err)
+		for _, secret := range []string{secretQuery, secretHost, secretID, "private-branch"} {
+			if strings.Contains(encoded, secret) {
+				t.Errorf("trace contains private value %q: %s", secret, encoded)
+			}
+		}
+		if got := record.start["pr.has_search_query"]; got != true {
+			t.Errorf("pr.has_search_query = %#v, want true", got)
+		}
+	}
+}
+
+func TestServerTraceDoesNotRecordPullRequestID(t *testing.T) {
+	const secretID = "gitlab:mr:987"
+	tracer := &serverRecordingTracer{}
+	s := New(&progressLoader{})
+	s.SetTracer(tracer)
+	inspectBody := strings.NewReader(`{"id":"` + secretID + `"}`)
+	s.inspect(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/v1/inspect", inspectBody))
+	includedBody := strings.NewReader(`{"pullRequests":[{"id":"` + secretID + `","includedPRs":[{"id":"private-included"}]}]}`)
+	s.included(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/v1/included", includedBody))
+
+	tracer.mu.Lock()
+	records := append([]*serverTraceRecord(nil), tracer.spans...)
+	tracer.mu.Unlock()
+	if len(records) != 2 {
+		t.Fatalf("recorded spans = %d, want 2", len(records))
+	}
+	for _, record := range records {
+		encoded := fmt.Sprintf("%s %v %v", record.name, record.start, record.end)
+		if strings.Contains(encoded, secretID) || strings.Contains(encoded, "private-included") {
+			t.Errorf("trace contains pull-request identity: %s", encoded)
+		}
 	}
 }
 
@@ -126,6 +243,39 @@ func TestGraphStreamsProgressAndResult(t *testing.T) {
 	}
 	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "application/x-ndjson") {
 		t.Fatalf("content type = %q", got)
+	}
+}
+
+func TestGraphStreamsTopologyBeforeComplete(t *testing.T) {
+	s := New(&stagedProgressLoader{})
+	recorder := &flushRecorder{ResponseRecorder: httptest.NewRecorder()}
+	s.graph(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/graph", nil))
+	lines := strings.Split(strings.TrimSpace(recorder.Body.String()), "\n")
+	stages := make([]string, 0, 2)
+	for _, line := range lines {
+		var event struct {
+			Type  string `json:"type"`
+			Stage string `json:"stage"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == "result" {
+			stages = append(stages, event.Stage)
+		}
+	}
+	if fmt.Sprint(stages) != "[topology complete]" {
+		t.Fatalf("result stages = %v, want topology then complete", stages)
+	}
+	topologyFlushedBeforeComplete := false
+	for _, snapshot := range recorder.snapshots {
+		if strings.Contains(snapshot, `"stage":"topology"`) && !strings.Contains(snapshot, `"stage":"complete"`) {
+			topologyFlushedBeforeComplete = true
+			break
+		}
+	}
+	if !topologyFlushedBeforeComplete {
+		t.Fatalf("topology was not flushed before complete: %v", recorder.snapshots)
 	}
 }
 

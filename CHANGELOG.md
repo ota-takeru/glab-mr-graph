@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 - Port the graph workspace to GitLab as `glab-mr-graph`, including authenticated `glab api` search, merge-request hydration, approval/pipeline status mapping, and exact project/branch stack discovery.
+- Bound GitLab refresh cost with pagination, request/refresh timeouts, and a subprocess budget; add correct approval-unavailable handling, cross-project fork stacks, parallel search/stack hydration with project singleflight, topology-first progressive rendering, and privacy-redacted OTLP traces.
 
 ## [0.14.6] - 2026-08-23
 

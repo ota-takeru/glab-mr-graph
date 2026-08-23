@@ -12,7 +12,7 @@
 | 取得境界 | `gh` CLI 経由の GitHub API | `glab` CLI 経由の GitLab REST API |
 | ワークスペース | 作成者、assignee、review request と検索結果を横断表示 | 作成者、assignee、review request とテキスト検索結果を OR で横断表示 |
 | グラフ | repository/branch と PR の stacked 関係 | target/source project と branch の厳密な MR 関係 |
-| 状態表示 | GitHub の review、checks、merge 状態を正規化 | approval 数、`head_pipeline`、確定した conflict を個別に表示 |
+| 状態表示 | GitHub の review、checks、merge 状態を正規化 | approval state/count、`head_pipeline`、確定した conflict を個別に表示 |
 | 操作 | ローカルの read-only グラフ | ローカルの read-only グラフ。コメント、approve、assign、merge は行わない |
 | 互換境界 | upstream の PR 向け DTO/UI | グラフ・サーバー・画面の共通部分を残し、取得と意味付けを GitLab 用に置換 |
 
@@ -38,10 +38,13 @@ GitLab 対応で provider 部分を置き換えたが、次の責務は upstream
 ### API境界: `glab`、REST、pagination、hostname
 
 - 認証はアプリが token を読むのではなく、認証済み `glab` subprocess に委譲する。通常の API 呼び出しは `glab api` で行う。
-- 一覧 endpoint には `--paginate` と `per_page=100` を付ける。`glab api --paginate` が複数の JSON 配列を改行で返しても、decoder が全 page を結合する。
+- 一覧 endpoint は `--paginate` を使わず、`per_page=100&page=N` を付けた `glab api` をページ単位で反復する。検索specごとの上限に達したら次ページを取得せず、`truncated` を内部で記録する。
 - detail、approval、project は個別 REST endpoint を使う。GitHub 版の GraphQL query を移植してはいない。
 - `--hostname HOST` を指定したときは `glab api --hostname HOST` として渡す。空なら `glab` の設定に任せ、GitLab.com と self-managed GitLab の両方を同じ client で扱う。
 - response body や stderr は通常ログへ出さない。空 response や decode 失敗はエラーとして扱う。
+- 開発用OpenTelemetryはopt-inで、span名・属性を固定operation名、状態、件数に限定する。
+  検索語、hostname、API endpoint、command args、project/MR ID、branch、response body、
+  外部error messageはtraceへ出さず、失敗はstatus code 2と固定`error.type`だけにする。
 
 これは「REST だから単純に同じ request になる」という意味ではない。GitLab 版は一覧、detail、approval、project を別々に取得するため、API 回数と利用可能な field の差を client 側で吸収している。
 
@@ -76,21 +79,28 @@ B.target_branch     == A.source_branch
 ```text
 A.source_project_id == B.target_project_id
 A.source_branch     == B.target_branch
-A.target_project_id == B.target_project_id
 ```
 
-API query の branch filter だけに依存せず、response を同じ identity 条件で再確認する。そのため、fork にある同名 branch や、target project が異なる MR を stack の edge として誤採用しない。
+API query は global な `/merge_requests?scope=all&state=opened&source_branch=...` を使い、
+branch filterだけに依存せず、responseの `source_project_id` と `source_branch` を同じ
+identity条件で再確認する。親のtarget projectが子のtarget projectと異なるvalidな
+cross-project forkは採用する一方、source projectが異なる同名branchのforkは拒否する。
+project metadataからdefault branchを取得できない場合はbase branchを推測せず、
+上流queryを発行しない。
 
 探索方向も制限する。直接検索 seed は上流・下流の両方を見るが、上流で見つかった MR は上流だけ、下流で見つかった MR は下流だけを引き続き見る。親を起点に親の別 child へ横展開することはない。上限到達時は graph を返しつつ warning を出し、検索を狭めるよう促す。
 
-### 並列 hydrate、project cache、graceful degradation
+### 並列検索・段階hydrate、project cache、graceful degradation
 
-- 四つの検索条件と branch ごとの stack 探索は現在は逐次実行する。GitHub 版の並列検索や GraphQL alias による同一 depth の batch query は移植していない。
-- 検索で得た MR の detail と approvals は最大 6 worker で並列に hydrate する。サーバーの refresh 自体は直列化し、polling と manual refresh が API cost を重ねない。
-- source/target project の namespace、URL、default branch を補う project lookup は process-local map に cache する。cache は disk に保存しない。
+- 最大四つの検索条件は最大6 workerで並列実行し、入力spec順に結果をmergeする。各検索specは最大500件まで手動paginationする。
+- stack探索は同じBFS depthの重複しないbranch queryを最大6 workerで並列実行する。frontier全体の候補をglobal MR IDで重複排除した後、project metadataだけを補う。topology配信後、全MRのdetailとapprovalsを一度の最大6 worker hydrateへ渡す。
+- workerはprogress callbackを直接呼ばず、検索結果とstack候補は安定した入力順で適用する。サーバーのrefresh自体は直列化し、pollingとmanual refreshがAPI costを重ねない。
+- `LoadProgress` はrefreshをデフォルト2分、各 `glab` requestを30秒に制限し、1 refreshあたりのsubprocess budgetを1200件に制限する。budget到達時は `/user` と検索をエラーにし、stack探索はwarningを出して停止し、detail・approvalは既存のdegradeへ乗せる。
+- source/target project の namespace、URL、default branch を補う project lookup は process-local map に cache する。同じproject IDの並行cache missは1回のAPI呼び出しを共有し、失敗はcacheせず再試行可能にする。待機側のcontext cancellationは個別に反映する。cache は disk に保存しない。
 - detail が失敗した場合は list response を残し、その MR を落とさない。project lookup が失敗しても、利用できる ID から fallback の表示情報を作る。
-- approval endpoint が権限不足、404、feature unavailable などで失敗しても MR は表示し、reviewer 数を fallback として使う。warning は重複排除して UI へ渡す。
+- approval endpoint が権限不足、404、feature unavailable などで失敗しても MR は表示し、`approvalState=UNAVAILABLE` とする。reviewer 数を approval rule の fallback には使わない。warning は重複排除して UI へ渡す。
 - 検索、`/user`、stack branch list など graph の入口に必要な request の失敗は、同じ意味で黙って成功扱いにはしない。graceful degradation の対象は主に MR 単位の detail、approval、project 補足である。
+- serverは `topology` と `complete` の二段階resultをNDJSONでflushする。topologyはlist dataとproject metadataから構築しapprovalを `LOADING` とする。browserは各resultを到着時に描画し、filterとviewportを維持する。status取得中にbudgetが尽きても表示済みtopologyを残し、complete resultでは該当statusを `UNAVAILABLE` とwarningへdegradeする。
 
 ### Approval 数、`head_pipeline`、確定 conflict
 
@@ -98,13 +108,14 @@ GitHub の per-reviewer review decision を再現するのではなく、GitLab 
 
 | 表示値 | 現在の根拠 |
 | --- | --- |
-| approved | `/approvals` の `approved_by` 件数。必要数と残数から補える場合は `approvals_required - approvals_left` を使う |
-| total | `approvals_required`。値が取れない、または 0 の場合は reviewer 件数へ fallback |
-| review decision | 必要 approval 数があり `approvals_left <= 0` の場合だけ `APPROVED`。それ以外の reviewer lifecycle は表さない |
+| approval state | `UNAVAILABLE`（取得失敗）、`NOT_REQUIRED`（required が0以下）、`APPROVED`（`approved=true` または required>0かつleft<=0）、それ以外は `PENDING`。取得途中用に `LOADING` も許容 |
+| approver count | `/approvals` の `approved_by` 件数。rule達成の判定には使わない |
+| required / remaining | `approvals_required` / `approvals_left`。reviewer 件数へ fallback しない |
+| review decision | 互換用に `APPROVED` state だけ `APPROVED` を出し、approval UI は新しい state/count fields を使う |
 | CI | `head_pipeline.status` を優先し、なければ `pipeline.status` を使う。success/failed/canceled/pending/running/skipped 等を共通状態へ正規化 |
 | conflict | `has_conflicts=true` または `detailed_merge_status=conflict` の場合だけ `CONFLICTING`。`checking`、`unchecked`、`cannot_be_merged`、`need_rebase` は確定 conflict としない |
 
-画面では `!IID`、approval 数、pipeline status、conflict、draft/ready を別々の status row として表示する。MR の `web_url` をそのままリンクに使い、project URL と `/-/tree/<branch>` URL も GitLab 形式で生成する。MR、project、branch のリンクは新しい tab で開く。
+画面では `!IID`、approval state/count、pipeline status、conflict、draft/ready を別々の status row として表示する。approval availability は reviewer 指定と混ぜない。MR の `web_url` をそのままリンクに使い、project URL と `/-/tree/<branch>` URL も GitLab 形式で生成する。MR、project、branch のリンクは新しい tab で開く。
 
 ## GitHub側との意味差
 
@@ -112,13 +123,16 @@ GitHub の per-reviewer review decision を再現するのではなく、GitLab 
 | --- | --- | --- |
 | 検索 | GitHub PR search の query syntax で author、label、review などを組み合わせられる | REST の scope と `search` parameter が中心。現行 UI は三つの scope + title/description の text search だけ |
 | ID | GraphQL global node ID が dedupe/identity、画面番号は repository 内の PR number | global MR `id` が dedupe/identity、画面番号は project 内 `iid`。stack では source/target project ID も必須 |
-| Reviewer と approval | review request、latest review、`reviewDecision` などを比較的直接に統合できる | reviewer 指定と approval rule/approval 数が別概念。現行版は reviewer list と aggregate approval 数だけを出す |
+| Reviewer と approval | review request、latest review、`reviewDecision` などを比較的直接に統合できる | reviewer 指定と approval rule/approval 数が別概念。現行版は reviewer list と、`approved`/required/remaining を根拠にしたapproval stateを別々に出す |
 | Changes requested / pending / re-review | GitHub 版が扱うレビュー lifecycle の状態 | GitLab 版では対応する履歴や個人単位状態を取得せず、DTO に残る旧フィールドも生成しない |
 | CI | checks/status の rollup を PR の状態として扱える | MR に紐づく head pipeline の状態だけ。pipeline 成功は、security policy、external status check、discussion、approval などを含む merge 可否とは同じではない |
 | Merge 状態 | GitHub の mergeable/merge state を別の状態として扱う | `detailed_merge_status` は非同期かつ多くの blocker を含む。現行版は誤検知を避け、確定 conflict のみを conflict 表示へ反映する |
 | Included | commit history と associated PR を使って Included PR を求められる | commit message/関連 MR の検査をまだ行わない。共通 DTO の Included フィールドは契約互換のため残るだけ |
 | Stack | repository + branch の対応をたどる | fork を含む source/target project と branch の条件を各方向で検証し、より厳密に edge を作る。GitLab native stack UI や `glab stack` の状態は利用しない |
-| API と性能 | GraphQL で必要 field をまとめ、検索を並列化し、同一 depth の branch query を alias で batch 化できる | REST の list/detail/approval/project を分けて取得する。検索と stack 探索は逐次、detail/approval hydrate は最大 6 並列とし、project cache、上限、warning で request cost と欠損を制御する |
+| API と性能 | GraphQL で必要 field をまとめ、検索を並列化し、同一 depth の branch query を alias で batch 化できる | REST の list/detail/approval/project を分けて取得する。listは手動pagination、検索specと同一BFS frontierのbranch queryを最大6並列とし、list由来topologyを先に配信してから全MRのdetail/approvalを最大6並列で一括hydrateする。project singleflight cache、request timeout、refresh timeout、1200 subprocess budget、warningでrequest costと欠損を制御する |
+
+traceのprivacy保証とMaxMRs/MaxDepthの上限は、Client/serverのrecording tracer、実OTLP
+payload、fixtureの明示的な上限テストで回帰確認する。
 
 この差により、GitLab の `reviewer` を GitHub の `reviewDecision` と同じ意味で表示したり、`head_pipeline=success` を「merge 可能」と表示したりすることはできない。現行の共通 DTO 名はデータの意味が完全一致することを宣言するものではなく、既存 graph/server/UI 契約を維持するための adapter 境界である。
 
@@ -135,7 +149,6 @@ GitHub の per-reviewer review decision を再現するのではなく、GitLab 
 | merge blocker 全般 | conflict 以外の CI、approval、discussion、security policy、external status check、merge train 等を blocker として列挙しない | `detailed_merge_status` の値を完全な merge 可否へ誤変換しない。pipeline と conflict は独立表示する |
 | native stack / `glab stack` 連携 | GitLab UI の native stacked MR や `glab stack` の作成・並べ替え・sync 状態を読まない、書かない | 本ツールは既存 MR の関係を横断表示する read-only workspace であり、stack manager ではない |
 | 書込操作 | comment、approve、assign、merge、rebase、stack 操作などを提供しない | 認証情報と副作用をローカル read-only 境界に閉じ込める |
-| progressive two-phase hydration | list の topology を先に表示し、後から detail/approval を段階的に差し込む方式は未実装 | 現在は検索結果を detail/approval hydrate してから graph を完成させる。進捗イベントはあるが、中間 graph を返す契約ではない |
 
 ## 現方針と将来追加の条件
 
@@ -145,7 +158,7 @@ GitHub の per-reviewer review decision を再現するのではなく、GitLab 
 
 `graph.PullRequest`、`reviewDecision`、`IncludedPRs` などの既存名は、GitLab の概念が GitHub と同一だからではなく、graph/server/UI の既存 JSON 契約を壊さないために保持する。新しい意味を追加する場合は、既存 field の意味を密かに変えず、provider を表す情報や独立した field を検討する。
 
-将来、検索条件の拡張、per-reviewer review 状態、詳細 approval rules、merge blockers、Included MR、二段階 hydration、native stack 連携を追加する場合は、少なくとも次を満たすことを条件とする。
+将来、検索条件の拡張、per-reviewer review 状態、詳細 approval rules、merge blockers、Included MR、native stack 連携を追加する場合は、少なくとも次を満たすことを条件とする。
 
 1. GitLab.com と主要な self-managed/version/tier の差を確認し、取得できない場合の fallback と warning を定義できること。
 2. GitHub の既存概念との対応が一対一でない場合に、UI と DTO で別の意味として説明でき、誤った完全互換を作らないこと。
