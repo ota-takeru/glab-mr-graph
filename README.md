@@ -64,10 +64,10 @@ are intentionally disabled.
 Use the built-in fixture data to work on the UI without querying GitLab:
 
 ```sh
-GH_PR_GRAPH_DEMO=1 ./glab-mr-graph
+GLAB_MR_GRAPH_DEMO=1 ./glab-mr-graph
 ```
 
-Demo mode is enabled only through `GH_PR_GRAPH_DEMO`; it is not a CLI option.
+Demo mode is enabled only through `GLAB_MR_GRAPH_DEMO`; it is not a CLI option.
 
 ## Development
 
@@ -89,7 +89,7 @@ For design decisions and data-flow limits, see [DESIGN.md](DESIGN.md).
 
 ## Tracing
 
-Set `GH_PR_GRAPH_TRACE_OTEL=1` to export optional OpenTelemetry traces to
+Set `GLAB_MR_GRAPH_TRACE_OTEL=1` to export optional OpenTelemetry traces to
 `http://localhost:4318/v1/traces`. Set the variable to an explicit collector
 URL to use a different endpoint. Tracing is best effort and does not include
 API response bodies or tokens.

@@ -27,7 +27,6 @@ import (
 
 const (
 	maxConcurrentGitLabRequests = 6
-	maxDiscoveryTargetsPerQuery = 20
 )
 
 // MaxMRs and MaxDepth are intentionally conservative.  A malformed or very
@@ -96,6 +95,7 @@ type rawUser struct {
 	Name      string `json:"name"`
 	AvatarURL string `json:"avatar_url"`
 	WebURL    string `json:"web_url"`
+	Bot       bool   `json:"bot"`
 }
 
 type rawProject struct {
@@ -137,6 +137,7 @@ type rawMergeRequest struct {
 	TargetBranch        string       `json:"target_branch"`
 	DetailedMergeStatus string       `json:"detailed_merge_status"`
 	MergeStatus         string       `json:"merge_status"`
+	HasConflicts        bool         `json:"has_conflicts"`
 	HeadPipeline        *rawPipeline `json:"head_pipeline"`
 	Pipeline            *rawPipeline `json:"pipeline"`
 	SourceProject       *rawProject  `json:"source_project"`
@@ -368,6 +369,7 @@ func mergeRequestOverlay(base, detail rawMergeRequest) rawMergeRequest {
 	// few fields. Keep list values when a detail field is empty.
 	detail.Draft = detail.Draft || base.Draft
 	detail.WorkInProgress = detail.WorkInProgress || base.WorkInProgress
+	detail.HasConflicts = detail.HasConflicts || base.HasConflicts
 	if detail.ID == 0 {
 		detail.ID = base.ID
 	}
@@ -425,15 +427,24 @@ func mergeRequestOverlay(base, detail rawMergeRequest) rawMergeRequest {
 	return detail
 }
 
+type stackDirection uint8
+
+const (
+	stackBoth stackDirection = iota
+	stackUpstream
+	stackDownstream
+)
+
 type stackItem struct {
-	pr    *graph.PullRequest
-	depth int
+	pr        *graph.PullRequest
+	depth     int
+	direction stackDirection
 }
 
 func (c *Client) discoverStacks(ctx context.Context, seeds []*graph.PullRequest, byID map[string]*graph.PullRequest, viewer string, report func(int, int, string, int)) (bool, []string) {
 	frontier := make([]stackItem, 0, len(seeds))
 	for _, seed := range seeds {
-		frontier = append(frontier, stackItem{pr: seed})
+		frontier = append(frontier, stackItem{pr: seed, direction: stackBoth})
 	}
 	visitedDownstream := make(map[string]bool)
 	visitedUpstream := make(map[string]bool)
@@ -441,8 +452,9 @@ func (c *Client) discoverStacks(ctx context.Context, seeds []*graph.PullRequest,
 	limitReached := false
 	processed := 0
 
-	// Process both directions in one BFS. This makes a seed's parents and
-	// children available at the same depth and keeps branch identity explicit.
+	// Direct search seeds can be explored in both directions. A node discovered
+	// upstream or downstream retains that direction, so an upstream parent
+	// cannot make the traversal fan out into its unrelated downstream siblings.
 	for len(frontier) > 0 && len(byID) < c.maxMRs() {
 		next := make([]stackItem, 0)
 		for _, current := range frontier {
@@ -450,15 +462,15 @@ func (c *Client) discoverStacks(ctx context.Context, seeds []*graph.PullRequest,
 			if current.depth >= c.maxDepth() {
 				continue
 			}
-			if current.pr.HeadRepositoryID != "" && current.pr.HeadRefName != "" {
+			if (current.direction == stackBoth || current.direction == stackDownstream) && current.pr.HeadRepositoryID != "" && current.pr.HeadRefName != "" {
 				key := refKey(current.pr.HeadRepositoryID, current.pr.HeadRefName)
 				if !visitedDownstream[key] {
 					visitedDownstream[key] = true
-					rawItems, err := c.listBranchMergeRequests(ctx, branchSearch{targetProject: current.pr.HeadRepositoryID, targetBranch: current.pr.HeadRefName})
+					rawItems, err := c.listBranchMergeRequests(ctx, branchSearch{projectID: current.pr.HeadRepositoryID, targetBranch: current.pr.HeadRefName})
 					if err != nil {
 						warnings = append(warnings, "Could not discover downstream GitLab merge requests for a stack branch.")
 					} else {
-						added, limit := c.addDiscovered(ctx, rawItems, byID, viewer, "downstream", current.depth+1, &next, current.pr)
+						added, limit := c.addDiscovered(ctx, rawItems, byID, viewer, "downstream", stackDownstream, current.depth+1, &next, current.pr)
 						if added > 0 {
 							report(processed, max(1, len(seeds)), "Discovering stacked merge requests", len(byID))
 						}
@@ -466,15 +478,15 @@ func (c *Client) discoverStacks(ctx context.Context, seeds []*graph.PullRequest,
 					}
 				}
 			}
-			if current.pr.RepositoryID != "" && current.pr.BaseRefName != "" && current.pr.BaseRefName != current.pr.DefaultBranch {
+			if (current.direction == stackBoth || current.direction == stackUpstream) && current.pr.RepositoryID != "" && current.pr.BaseRefName != "" && current.pr.BaseRefName != current.pr.DefaultBranch {
 				key := refKey(current.pr.RepositoryID, current.pr.BaseRefName)
 				if !visitedUpstream[key] {
 					visitedUpstream[key] = true
-					rawItems, err := c.listBranchMergeRequests(ctx, branchSearch{sourceProject: current.pr.RepositoryID, targetProject: current.pr.RepositoryID, sourceBranch: current.pr.BaseRefName})
+					rawItems, err := c.listBranchMergeRequests(ctx, branchSearch{projectID: current.pr.RepositoryID, sourceBranch: current.pr.BaseRefName})
 					if err != nil {
 						warnings = append(warnings, "Could not discover upstream GitLab merge requests for a stack branch.")
 					} else {
-						added, limit := c.addDiscovered(ctx, rawItems, byID, viewer, "upstream", current.depth+1, &next, current.pr)
+						added, limit := c.addDiscovered(ctx, rawItems, byID, viewer, "upstream", stackUpstream, current.depth+1, &next, current.pr)
 						if added > 0 {
 							report(processed, max(1, len(seeds)), "Discovering stacked merge requests", len(byID))
 						}
@@ -492,13 +504,12 @@ func (c *Client) discoverStacks(ctx context.Context, seeds []*graph.PullRequest,
 }
 
 type branchSearch struct {
-	sourceProject string
-	targetProject string
-	sourceBranch  string
-	targetBranch  string
+	projectID    string
+	sourceBranch string
+	targetBranch string
 }
 
-func (c *Client) addDiscovered(ctx context.Context, rawItems []rawMergeRequest, byID map[string]*graph.PullRequest, viewer, source string, depth int, next *[]stackItem, current *graph.PullRequest) (int, bool) {
+func (c *Client) addDiscovered(ctx context.Context, rawItems []rawMergeRequest, byID map[string]*graph.PullRequest, viewer, source string, direction stackDirection, depth int, next *[]stackItem, current *graph.PullRequest) (int, bool) {
 	added, limitReached := 0, false
 	for _, raw := range rawItems {
 		if len(byID) >= c.maxMRs() {
@@ -541,7 +552,7 @@ func (c *Client) addDiscovered(ctx context.Context, rawItems []rawMergeRequest, 
 		}
 		pr.Relation = graph.RelationFor(pr, viewer, hasReviewer(items[0].mr, viewer))
 		byID[id] = pr
-		*next = append(*next, stackItem{pr: pr, depth: depth})
+		*next = append(*next, stackItem{pr: pr, depth: depth, direction: direction})
 		added++
 	}
 	return added, limitReached
@@ -593,20 +604,14 @@ func (c *Client) listMergeRequests(ctx context.Context, spec searchSpec) ([]rawM
 }
 
 func (c *Client) listBranchMergeRequests(ctx context.Context, search branchSearch) ([]rawMergeRequest, error) {
-	values := url.Values{"per_page": {"100"}, "scope": {"all"}, "state": {"opened"}}
-	if search.sourceProject != "" {
-		values.Set("source_project_id", search.sourceProject)
-	}
-	if search.targetProject != "" {
-		values.Set("target_project_id", search.targetProject)
-	}
+	values := url.Values{"per_page": {"100"}, "state": {"opened"}}
 	if search.sourceBranch != "" {
 		values.Set("source_branch", search.sourceBranch)
 	}
 	if search.targetBranch != "" {
 		values.Set("target_branch", search.targetBranch)
 	}
-	return c.listAPI(ctx, "list stacked merge requests", queryPath("/merge_requests", values))
+	return c.listAPI(ctx, "list stacked merge requests", queryPath("/projects/"+url.PathEscape(search.projectID)+"/merge_requests", values))
 }
 
 func (c *Client) listAPI(ctx context.Context, operation, endpoint string) ([]rawMergeRequest, error) {
@@ -743,7 +748,11 @@ func (c *Client) convert(raw rawMergeRequest, approval *rawApproval, viewer, sou
 	}
 	sourceProject := raw.SourceProject
 	if sourceProject == nil {
-		sourceProject = target
+		if raw.SourceProjectID > 0 && raw.SourceProjectID != raw.TargetProjectID {
+			sourceProject = &rawProject{ID: raw.SourceProjectID, PathWithNamespace: fmt.Sprintf("project/%d", raw.SourceProjectID)}
+		} else {
+			sourceProject = target
+		}
 	}
 	pr := &graph.PullRequest{
 		ID: id, Number: raw.IID, Title: raw.Title, URL: raw.WebURL, IsDraft: raw.Draft || raw.WorkInProgress,
@@ -761,7 +770,7 @@ func (c *Client) convert(raw rawMergeRequest, approval *rawApproval, viewer, sou
 	}
 	if raw.Author != nil {
 		pr.Author = graph.User{Login: gitlabLogin(*raw.Author), AvatarURL: raw.Author.AvatarURL}
-		pr.IsBot = strings.HasSuffix(strings.ToLower(pr.Author.Login), "[bot]") || strings.Contains(strings.ToLower(pr.Author.Login), "bot")
+		pr.IsBot = raw.Author.Bot || strings.HasSuffix(strings.ToLower(pr.Author.Login), "[bot]")
 	}
 	for _, assignee := range raw.Assignees {
 		pr.Assignees = append(pr.Assignees, graph.User{Login: gitlabLogin(assignee), AvatarURL: assignee.AvatarURL})
@@ -824,13 +833,14 @@ func pipelineState(mr rawMergeRequest) string {
 }
 
 func mergeState(mr rawMergeRequest) string {
+	if mr.HasConflicts || strings.EqualFold(mr.DetailedMergeStatus, "conflict") {
+		return "CONFLICTING"
+	}
 	status := strings.ToLower(mr.DetailedMergeStatus)
 	if status == "" {
 		status = strings.ToLower(mr.MergeStatus)
 	}
 	switch status {
-	case "conflict", "cannot_be_merged", "cannot_be_merged_recheck", "need_rebase", "unchecked":
-		return "CONFLICTING"
 	case "mergeable", "can_be_merged", "not_approved", "approvals_syncing":
 		return "MERGEABLE"
 	default:

@@ -2,6 +2,7 @@ package demo
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/ota-takeru/glab-mr-graph/internal/graph"
@@ -44,5 +45,17 @@ func TestLoadProvidesScreenshotScenario(t *testing.T) {
 	}
 	if relations["mine"] != 1 || relations["assigned"] != 1 || relations["review-requested"] != 2 || relations["other"] != 1 {
 		t.Fatalf("relations = %+v", relations)
+	}
+}
+
+func TestLoadUsesGitLabBranchURLs(t *testing.T) {
+	result, err := New().Load(context.Background(), graph.SearchOptions{Authored: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range result.Nodes {
+		if node.Kind == "branch" && !strings.Contains(node.Branch.URL, "/-/tree/") {
+			t.Fatalf("branch URL = %q, want GitLab tree URL", node.Branch.URL)
+		}
 	}
 }

@@ -49,6 +49,8 @@ glab-mr-graph
 - `--hostname` が指定された場合は `glab api --hostname HOST` を使う。
   空の場合はglabの既定host設定に任せ、GitLab.com/Self-managedの両方に対応する。
 - browser起動は `--no-open` で抑止でき、`--port` でportを固定できる。
+- デモは `GLAB_MR_GRAPH_DEMO=1`、開発用traceは
+  `GLAB_MR_GRAPH_TRACE_OTEL=1`（またはcollector URL）だけで有効にする。
 
 ## 3. GitLab APIクライアント
 
@@ -102,17 +104,21 @@ default branchを補う。detailが失敗してもlist responseを残す。appro
 | assignees/reviewers | `assignees` / `reviewers` |
 | approvals | `/approvals` の `approved_by`, `approvals_required`, `approvals_left` |
 | CI | detail/listの `head_pipeline.status` |
-| conflict | `detailed_merge_status` / `merge_status` |
+| conflict | `has_conflicts` または `detailed_merge_status=conflict` |
 
 Pipeline statusは `SUCCESS`, `FAILURE`, `PENDING`, `SKIPPED`, `UNKNOWN` へ、
-conflictは `CONFLICTING` へ正規化する。relationの優先順位は `mine`、
+`has_conflicts=true` または `detailed_merge_status=conflict` の場合だけ
+conflictを `CONFLICTING` へ正規化する。`unchecked`、`checking`、
+`cannot_be_merged`、`need_rebase` は競合確定とは扱わない。relationの優先順位は `mine`、
 `assigned`、`review-requested`、`other` であり、既存 `graph.RelationFor` を使う。
 
 ## 4. stack探索とグラフ意味
 
 探索は検索へ直接一致したMRをseedとしたBFSである。上限はseedを含めて
 500 MR、深さ20とし、global MR idとbranch identityのvisited setで重複・循環を
-防止する。
+防止する。直接検索seedは上流・下流の両方向を探索するが、上流で見つけた
+親MRは上流だけ、下流で見つけた子MRは下流だけを探索する。これにより、
+seedの親から親の別childへ横展開しない。
 
 ### 下流
 
@@ -124,9 +130,9 @@ B.target_project_id == A.source_project_id
 B.target_branch     == A.source_branch
 ```
 
-API queryは `target_project_id` と `target_branch` を使い、レスポンスを同じ
-identity条件で再確認する。source projectがforkでも、target projectが一致
-しなければ接続しない。
+API queryは `/projects/:source_project_id/merge_requests?target_branch=...`
+を使い、レスポンスを同じidentity条件で再確認する。source projectがforkでも、
+target projectが一致しなければ接続しない。
 
 ### 上流
 
@@ -139,6 +145,8 @@ A.source_branch     == B.target_branch
 A.target_project_id == B.target_project_id
 ```
 
+API queryは `/projects/:target_project_id/merge_requests?source_branch=...`
+を使い、`target_project_id` と `source_project_id` をレスポンスで再確認する。
 `target_project_id` がdefault projectでないMRや、同名branchを持つforkは誤って
 親に採用しない。default branchへ戻れないbaseは既存graph builderのbranch nodeへ
 接続する。

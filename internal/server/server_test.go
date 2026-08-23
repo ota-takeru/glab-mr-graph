@@ -20,13 +20,13 @@ type fakeLoader struct{ options graph.SearchOptions }
 type progressLoader struct{ fakeLoader }
 
 func (f *progressLoader) LoadProgress(_ context.Context, _ graph.SearchOptions, progress func(int, int, string, int)) (graph.Result, error) {
-	progress(1, 1, "Searching pull requests", 1)
-	progress(1, 1, "Discovering stacked pull requests", 1)
+	progress(1, 1, "Searching merge requests", 1)
+	progress(1, 1, "Discovering stacked merge requests", 1)
 	return graph.Result{UpdatedAt: time.Unix(1, 0)}, nil
 }
 
 func (f *progressLoader) LoadIncluded(_ context.Context, prs []*graph.PullRequest, progress func(int, int, string)) ([]graph.IncludedUpdate, error) {
-	progress(len(prs), len(prs), "Inspecting included pull requests")
+	progress(len(prs), len(prs), "Inspecting merge request details")
 	return []graph.IncludedUpdate{{PullRequestID: "pr1", IncludedPullRequests: []graph.IncludedPullRequest{{ID: "included1", Number: 1}}}}, nil
 }
 
@@ -103,9 +103,9 @@ func TestProgressPercent(t *testing.T) {
 		phase          string
 		want           int
 	}{
-		{1, 2, "Searching pull requests", 10},
-		{1, 2, "Discovering stacked pull requests", 42},
-		{1, 2, "Inspecting included pull requests", 82},
+		{1, 2, "Searching merge requests", 10},
+		{1, 2, "Discovering stacked merge requests", 42},
+		{1, 2, "Inspecting merge request details", 82},
 		{1, 2, "Fetching included pull requests", 95},
 		{1, 1, "Complete", 100},
 	}
@@ -121,7 +121,7 @@ func TestGraphStreamsProgressAndResult(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	s.graph(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/graph", nil))
 	body := recorder.Body.String()
-	if !strings.Contains(body, `"percent":65`) || !strings.Contains(body, `"phase":"Inspecting pull request commits"`) || !strings.Contains(body, `"collected":1`) || !strings.Contains(body, `"type":"result"`) {
+	if !strings.Contains(body, `"percent":80`) || !strings.Contains(body, `"phase":"Building merge request graph"`) || !strings.Contains(body, `"collected":0`) || !strings.Contains(body, `"type":"result"`) {
 		t.Fatalf("unexpected stream: %s", body)
 	}
 	if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, "application/x-ndjson") {

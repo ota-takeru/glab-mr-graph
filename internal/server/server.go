@@ -178,13 +178,7 @@ func (s *Server) graphStream(w http.ResponseWriter, r *http.Request, loader prog
 			collected++
 		}
 	}
-	// GitLab's first version is intentionally read-only and does not inspect
-	// merge commits for Included MRs. Keep the legacy inspection stream for
-	// compatible loaders, but do not make the GitLab client pretend to support
-	// that feature.
-	if _, ok := s.loader.(inspectLoader); ok {
-		_ = encoder.Encode(map[string]any{"type": "progress", "current": 0, "total": 1, "phase": "Inspecting pull request commits", "percent": 65, "collected": collected})
-	}
+	_ = encoder.Encode(map[string]any{"type": "progress", "current": 1, "total": 1, "phase": "Building merge request graph", "percent": 80, "collected": collected})
 	_ = encoder.Encode(map[string]any{"type": "result", "result": result})
 	return nil
 }
@@ -204,7 +198,7 @@ func searchOptions(r *http.Request) graph.SearchOptions {
 func (s *Server) inspect(w http.ResponseWriter, r *http.Request) {
 	loader, ok := s.loader.(inspectLoader)
 	if !ok {
-		http.Error(w, "pull request inspection is not supported", http.StatusNotImplemented)
+		http.Error(w, "merge request inspection is not supported", http.StatusNotImplemented)
 		return
 	}
 	var pr graph.PullRequest
@@ -234,7 +228,7 @@ func (s *Server) inspect(w http.ResponseWriter, r *http.Request) {
 func (s *Server) included(w http.ResponseWriter, r *http.Request) {
 	loader, ok := s.loader.(includedLoader)
 	if !ok {
-		http.Error(w, "included pull requests are not supported", http.StatusNotImplemented)
+		http.Error(w, "included merge requests are not supported", http.StatusNotImplemented)
 		return
 	}
 	var request struct {
@@ -246,7 +240,7 @@ func (s *Server) included(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(request.PullRequests) != 1 {
-		http.Error(w, "exactly one containing pull request is required", http.StatusBadRequest)
+		http.Error(w, "exactly one containing merge request is required", http.StatusBadRequest)
 		return
 	}
 	var requestSpan oteltrace.Span
@@ -304,7 +298,7 @@ func progressPercent(current, total int, phase string) int {
 		return int(ratio * 20)
 	case "Discovering stacked pull requests", "Discovering stacked merge requests":
 		return 20 + int(ratio*45)
-	case "Inspecting included pull requests":
+	case "Inspecting merge request details", "Inspecting included pull requests":
 		return 65 + int(ratio*35)
 	case "Fetching included pull requests":
 		return 90 + int(ratio*10)

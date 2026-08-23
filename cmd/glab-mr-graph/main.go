@@ -41,23 +41,23 @@ func main() {
 
 	client := gitlab.New(hostname)
 	var loader server.Loader = client
-	if os.Getenv("GH_PR_GRAPH_DEMO") == "1" {
+	if os.Getenv("GLAB_MR_GRAPH_DEMO") == "1" {
 		loader = demo.New()
-		fmt.Fprintln(os.Stderr, "glab-mr-graph: GH_PR_GRAPH_DEMO enabled; using demo data")
+		fmt.Fprintln(os.Stderr, "glab-mr-graph: GLAB_MR_GRAPH_DEMO enabled; using demo data")
 	}
 	var exporter *oteltrace.Exporter
-	if endpoint, enabled := os.LookupEnv("GH_PR_GRAPH_TRACE_OTEL"); enabled {
+	if endpoint, enabled := os.LookupEnv("GLAB_MR_GRAPH_TRACE_OTEL"); enabled {
 		if endpoint == "1" || endpoint == "true" {
 			endpoint = ""
 		}
 		var err error
 		exporter, err = oteltrace.New(endpoint)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "glab-mr-graph: invalid GH_PR_GRAPH_TRACE_OTEL:", err)
+			fmt.Fprintln(os.Stderr, "glab-mr-graph: invalid GLAB_MR_GRAPH_TRACE_OTEL:", err)
 			os.Exit(2)
 		}
 		client.Tracer = exporter
-		fmt.Fprintf(os.Stderr, "glab-mr-graph: GH_PR_GRAPH_TRACE_OTEL enabled; exporting traces to %s\n", exporter.Endpoint())
+		fmt.Fprintf(os.Stderr, "glab-mr-graph: GLAB_MR_GRAPH_TRACE_OTEL enabled; exporting traces to %s\n", exporter.Endpoint())
 	}
 	app := server.New(loader)
 	app.SetVersion(version)

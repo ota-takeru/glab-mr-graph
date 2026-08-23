@@ -84,6 +84,79 @@ func TestConvertNormalizesGitLabStatusAndApprovalData(t *testing.T) {
 	}
 }
 
+func TestMergeStateOnlyReportsConfirmedConflicts(t *testing.T) {
+	tests := []struct {
+		name         string
+		raw          rawMergeRequest
+		wantConflict bool
+	}{
+		{name: "has conflicts", raw: rawMergeRequest{HasConflicts: true, DetailedMergeStatus: "checking"}, wantConflict: true},
+		{name: "conflict status", raw: rawMergeRequest{DetailedMergeStatus: "conflict"}, wantConflict: true},
+		{name: "unchecked", raw: rawMergeRequest{DetailedMergeStatus: "unchecked"}},
+		{name: "cannot be merged", raw: rawMergeRequest{DetailedMergeStatus: "cannot_be_merged"}},
+		{name: "need rebase", raw: rawMergeRequest{DetailedMergeStatus: "need_rebase"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := mergeState(tt.raw) == "CONFLICTING"; got != tt.wantConflict {
+				t.Fatalf("conflict = %v, want %v (state %q)", got, tt.wantConflict, mergeState(tt.raw))
+			}
+		})
+	}
+}
+
+func TestBotDetectionUsesGitLabBotFlagOrExplicitSuffix(t *testing.T) {
+	base := rawMergeRequest{ID: 1, IID: 1, TargetProjectID: 10, SourceProjectID: 10}
+	tests := []struct {
+		name   string
+		author rawUser
+		want   bool
+	}{
+		{name: "api bot flag", author: rawUser{Username: "release-service", Bot: true}, want: true},
+		{name: "bot suffix", author: rawUser{Username: "dependabot[bot]"}, want: true},
+		{name: "botanist is human", author: rawUser{Username: "botanist"}},
+		{name: "robotics is human", author: rawUser{Username: "robotics"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := base
+			raw.Author = &tt.author
+			if got := New("").convert(raw, nil, "viewer", "search").IsBot; got != tt.want {
+				t.Fatalf("IsBot = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSourceProjectFallbackKeepsForkIdentity(t *testing.T) {
+	raw := rawMergeRequest{ID: 2, IID: 2, TargetProjectID: 10, SourceProjectID: 11, SourceBranch: "topic", TargetBranch: "main"}
+	got := New("").convert(raw, nil, "viewer", "search")
+	if got.HeadRepositoryID != "11" || got.HeadRepository != "project/11" {
+		t.Fatalf("source fallback = %q/%q, want 11/project/11", got.HeadRepositoryID, got.HeadRepository)
+	}
+}
+
+func TestBranchDiscoveryUsesProjectScopedEndpoint(t *testing.T) {
+	var endpoint string
+	c := New("")
+	c.Runner = RunnerFunc(func(_ context.Context, args []string) ([]byte, error) {
+		endpoint = args[len(args)-1]
+		return []byte(`[]`), nil
+	})
+	if _, err := c.listBranchMergeRequests(context.Background(), branchSearch{projectID: "10", sourceBranch: "feature/a"}); err != nil {
+		t.Fatal(err)
+	}
+	if endpoint != "/projects/10/merge_requests?per_page=100&source_branch=feature%2Fa&state=opened" {
+		t.Fatalf("upstream endpoint = %q", endpoint)
+	}
+	if _, err := c.listBranchMergeRequests(context.Background(), branchSearch{projectID: "10", targetBranch: "feature/a"}); err != nil {
+		t.Fatal(err)
+	}
+	if endpoint != "/projects/10/merge_requests?per_page=100&state=opened&target_branch=feature%2Fa" {
+		t.Fatalf("downstream endpoint = %q", endpoint)
+	}
+}
+
 func TestExactProjectAndBranchIdentity(t *testing.T) {
 	child := &graph.PullRequest{RepositoryID: "10", BaseRefName: "stack-1"}
 	if !isUpstreamParent(&graph.PullRequest{RepositoryID: "10", HeadRepositoryID: "10", HeadRefName: "stack-1"}, child) {
@@ -166,7 +239,7 @@ func TestLoadDedupeAndBuildsExactStack(t *testing.T) {
 			return []byte(`{"id":102,"iid":2,"state":"opened","target_project_id":10,"source_project_id":10,"target_branch":"feature-a","source_branch":"feature-b","title":"Child","web_url":"https://gitlab.test/acme/app/-/merge_requests/2","reviewers":[{"username":"me"}]}`), nil
 		case endpoint == "/projects/10":
 			return []byte(`{"id":10,"path_with_namespace":"acme/app","web_url":"https://gitlab.test/acme/app","default_branch":"main"}`), nil
-		case strings.HasPrefix(endpoint, "/merge_requests?"):
+		case strings.HasPrefix(endpoint, "/projects/10/merge_requests?"):
 			return []byte(`[]`), nil
 		default:
 			return nil, errors.New("unexpected fixture endpoint: " + endpoint)
@@ -189,5 +262,57 @@ func TestLoadDedupeAndBuildsExactStack(t *testing.T) {
 	}
 	if prs != 2 || edges != 1 {
 		t.Fatalf("graph contains %d MRs and %d stack edges, want 2 and 1: %+v", prs, edges, result)
+	}
+}
+
+func TestUpstreamDiscoveryDoesNotFanOutIntoParentSiblings(t *testing.T) {
+	c := New("")
+	c.Runner = RunnerFunc(func(_ context.Context, args []string) ([]byte, error) {
+		endpoint := args[len(args)-1]
+		switch {
+		case endpoint == "/user":
+			return []byte(`{"username":"me"}`), nil
+		case strings.Contains(endpoint, "scope=assigned_to_me"):
+			return []byte(`[ {"id":301,"iid":1,"state":"opened","title":"Seed child","web_url":"https://gitlab.test/acme/app/-/merge_requests/1","target_project_id":10,"source_project_id":10,"target_branch":"feature-parent","source_branch":"feature-seed","author":{"username":"other"}} ]`), nil
+		case strings.HasSuffix(endpoint, "/approvals"):
+			return []byte(`{"approvals_required":0,"approvals_left":0,"approved_by":[]}`), nil
+		case strings.Contains(endpoint, "/merge_requests/"):
+			switch {
+			case strings.HasSuffix(endpoint, "/1"):
+				return []byte(`{"id":301,"iid":1,"state":"opened","target_project_id":10,"source_project_id":10,"target_branch":"feature-parent","source_branch":"feature-seed","title":"Seed child","web_url":"https://gitlab.test/acme/app/-/merge_requests/1"}`), nil
+			case strings.HasSuffix(endpoint, "/2"):
+				return []byte(`{"id":302,"iid":2,"state":"opened","target_project_id":10,"source_project_id":10,"target_branch":"main","source_branch":"feature-parent","title":"Parent","web_url":"https://gitlab.test/acme/app/-/merge_requests/2"}`), nil
+			default:
+				return []byte(`{"id":303,"iid":3,"state":"opened","target_project_id":10,"source_project_id":10,"target_branch":"feature-parent","source_branch":"sibling","title":"Sibling","web_url":"https://gitlab.test/acme/app/-/merge_requests/3"}`), nil
+			}
+		case endpoint == "/projects/10":
+			return []byte(`{"id":10,"path_with_namespace":"acme/app","web_url":"https://gitlab.test/acme/app","default_branch":"main"}`), nil
+		case strings.Contains(endpoint, "source_branch=feature-parent"):
+			return []byte(`[ {"id":302,"iid":2,"state":"opened","target_project_id":10,"source_project_id":10,"target_branch":"main","source_branch":"feature-parent","title":"Parent","web_url":"https://gitlab.test/acme/app/-/merge_requests/2"} ]`), nil
+		case strings.Contains(endpoint, "target_branch=feature-parent"):
+			return []byte(`[ {"id":303,"iid":3,"state":"opened","target_project_id":10,"source_project_id":10,"target_branch":"feature-parent","source_branch":"sibling","title":"Sibling","web_url":"https://gitlab.test/acme/app/-/merge_requests/3"} ]`), nil
+		case strings.HasPrefix(endpoint, "/projects/10/merge_requests?"):
+			return []byte(`[]`), nil
+		default:
+			return nil, errors.New("unexpected fixture endpoint: " + endpoint)
+		}
+	})
+	result, err := c.Load(context.Background(), graph.SearchOptions{Assigned: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range result.Nodes {
+		if node.Kind == "pullRequest" && node.PR.Number == 3 {
+			t.Fatal("parent sibling was discovered from an upstream-only node")
+		}
+	}
+	count := 0
+	for _, node := range result.Nodes {
+		if node.Kind == "pullRequest" {
+			count++
+		}
+	}
+	if count != 2 {
+		t.Fatalf("merge request count = %d, want seed and parent only", count)
 	}
 }
