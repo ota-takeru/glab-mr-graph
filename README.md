@@ -17,8 +17,6 @@ artifacts are GitLab-specific.
 
 - [GitLab CLI (`glab`)](https://gitlab.com/gitlab-org/cli), authenticated with
   `glab auth login`
-- Git for Windows when installing on Windows, with its `sh` on `PATH` (`glab`
-  runs shell aliases through `sh`)
 - Go 1.23 or newer when building from source
 
 The authenticated `glab` configuration supplies the token for GitLab.com or a
@@ -29,9 +27,7 @@ the browser or written to disk.
 
 The installer downloads the release binary into your user account and registers
 a managed `glab` shell alias. Review the linked installer before piping remote
-code into a shell. These commands become usable after the first GitLab version
-of this project is published in GitHub Releases; until then, build from source
-as shown below. On macOS, Linux, or FreeBSD:
+code into a shell. On macOS, Linux, or FreeBSD:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ota-takeru/glab-mr-graph/main/scripts/install.sh | sh
@@ -47,15 +43,20 @@ glab mr-graph
 
 The POSIX installer uses `$XDG_BIN_HOME`, or `~/.local/bin` when it is unset.
 The Windows installer uses `%LOCALAPPDATA%\glab-mr-graph\bin` and adds that exact
-directory to the user `PATH`. Override either location with
+directory to the user `PATH`. Git for Windows is not required: when `glab`
+cannot use an existing shell, the installer adds a narrowly scoped compatibility
+`sh.exe` under the private `runtime` directory and appends that directory to
+the user `PATH`. The shim accepts only the managed `mr-graph` alias; it does not
+interpret arbitrary shell commands. An existing shell remains ahead of the
+private runtime and is preferred. Override either install location with
 `GLAB_MR_GRAPH_INSTALL_DIR`. Set `GLAB_MR_GRAPH_VERSION` to a published release
 tag matching `vX.Y.Z` to pin a version; the default is the latest release.
-Running the installer again upgrades the binary in place.
+Running the installer again upgrades the binary and managed shim in place.
 
-The installer refuses to replace an existing `mr-graph` alias unless it exactly
-matches the alias managed for this installation. It downloads to a temporary
-file before replacing the binary, so a failed download leaves the installed
-version intact.
+The installer refuses to replace an existing `mr-graph` alias or shell runtime
+unless it is marked as managed by this installation. Downloads complete in
+temporary files before replacement; a download or alias registration failure
+restores both the previous binary and previous shim.
 
 To uninstall on macOS, Linux, or FreeBSD:
 
@@ -69,9 +70,10 @@ On Windows PowerShell:
 irm https://raw.githubusercontent.com/ota-takeru/glab-mr-graph/main/scripts/uninstall.ps1 | iex
 ```
 
-Uninstall removes only the managed alias and the binary at the configured
-install path. On Windows it also removes a `PATH` entry only when that entry was
-added by the installer. An unrelated `mr-graph` alias is preserved.
+Uninstall removes only the managed alias, binary, and compatibility shim at the
+configured install path. On Windows it removes `PATH` entries only when they
+were added by the installer. Pre-existing shells, `PATH` entries, and unrelated
+`mr-graph` aliases are preserved.
 
 You can also download a release asset named for the target platform, or build
 the standalone binary locally:
@@ -134,7 +136,8 @@ bash scripts/install_test.sh
 pwsh -File scripts/install_test.ps1
 ```
 
-`GLAB_MR_GRAPH_ASSET_PATH` supplies the local fixture binary for these tests.
+`GLAB_MR_GRAPH_ASSET_PATH` and `GLAB_MR_GRAPH_SHIM_ASSET_PATH` supply local
+fixture binaries for these tests.
 
 The provider lives in `internal/gitlab`. It invokes `glab api` with manual
 `per_page=100&page=N` pagination, stops each search spec at 500 items, and

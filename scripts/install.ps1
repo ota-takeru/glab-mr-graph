@@ -78,12 +78,39 @@ function Remove-UserPathEntry {
     $env:Path = ($processEntries -join ';')
 }
 
+function Get-GlabShellPath {
+    $shell = Get-Command sh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $shell) {
+        return $shell.Source
+    }
+
+    $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $git) {
+        return $null
+    }
+    $gitShell = [System.IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $git.Source) '..\bin\sh.exe'))
+    if (Test-Path -LiteralPath $gitShell -PathType Leaf) {
+        return $gitShell
+    }
+    return $null
+}
+
+function Save-InstallerAsset {
+    param([AllowNull()][string]$LocalPath, [string]$Uri, [string]$Destination)
+
+    if (-not [string]::IsNullOrEmpty($LocalPath)) {
+        Copy-Item -LiteralPath $LocalPath -Destination $Destination -Force
+    } else {
+        Invoke-WebRequest -Uri $Uri -OutFile $Destination -UseBasicParsing -TimeoutSec 120
+    }
+    if (-not (Test-Path -LiteralPath $Destination -PathType Leaf) -or (Get-Item -LiteralPath $Destination).Length -eq 0) {
+        Stop-Installer "downloaded release asset is empty: $Uri"
+    }
+}
+
 $glab = Get-Command glab -ErrorAction SilentlyContinue
 if ($null -eq $glab) {
     Stop-Installer 'glab is required; install GitLab CLI and run glab auth login first'
-}
-if ($null -eq (Get-Command sh -ErrorAction SilentlyContinue)) {
-    Stop-Installer 'Git for Windows sh is required because glab runs shell aliases through sh'
 }
 
 $aliasOutput = @(& glab alias list 2>$null)
@@ -115,6 +142,8 @@ switch ($rawArch.ToUpperInvariant()) {
 
 $assetName = "windows-$releaseArch.exe"
 $downloadUrl = "https://github.com/ota-takeru/glab-mr-graph/releases/$versionPath/$assetName"
+$shimAssetName = "windows-shim-$releaseArch.exe"
+$shimDownloadUrl = "https://github.com/ota-takeru/glab-mr-graph/releases/$versionPath/$shimAssetName"
 $requestedInstallDir = if (-not [string]::IsNullOrEmpty($env:GLAB_MR_GRAPH_INSTALL_DIR)) {
     $env:GLAB_MR_GRAPH_INSTALL_DIR
 } elseif (-not [string]::IsNullOrEmpty($env:LOCALAPPDATA)) {
@@ -128,19 +157,36 @@ $installDir = [System.IO.Path]::GetFullPath($requestedInstallDir).TrimEnd('\', '
 $binaryPath = Join-Path $installDir 'glab-mr-graph.exe'
 $pathMarker = Join-Path $installDir '.glab-mr-graph-path-added'
 $markerExisted = Test-Path -LiteralPath $pathMarker -PathType Leaf
+$runtimeDir = Join-Path $installDir 'runtime'
+$shimPath = Join-Path $runtimeDir 'sh.exe'
+$shimMarker = Join-Path $runtimeDir '.glab-mr-graph-shim-managed'
+$runtimePathMarker = Join-Path $runtimeDir '.glab-mr-graph-path-added'
+$shimMarkerExisted = Test-Path -LiteralPath $shimMarker -PathType Leaf
+$runtimeMarkerExisted = Test-Path -LiteralPath $runtimePathMarker -PathType Leaf
+$existingShellPath = Get-GlabShellPath
+$forceShimFixture = -not [string]::IsNullOrEmpty($env:GLAB_MR_GRAPH_SHIM_ASSET_PATH)
+$installShim = $forceShimFixture -or $null -eq $existingShellPath -or $shimMarkerExisted
+
+if ($installShim) {
+    [System.IO.Directory]::CreateDirectory($runtimeDir) | Out-Null
+    if ((Test-Path -LiteralPath $shimPath -PathType Leaf) -and -not $shimMarkerExisted) {
+        Stop-Installer "refusing to replace an unmanaged shell runtime at $shimPath"
+    }
+}
+
 $tempPath = Join-Path $installDir ('.glab-mr-graph.download.{0}.tmp' -f ([guid]::NewGuid().ToString('N')))
+$shimTempPath = if ($installShim) { Join-Path $runtimeDir ('.glab-mr-graph-shim.download.{0}.tmp' -f ([guid]::NewGuid().ToString('N'))) } else { $null }
 $backupPath = $null
+$shimBackupPath = $null
 $installed = $false
+$shimInstalled = $false
 $pathAdded = $false
+$runtimePathAdded = $false
 
 try {
-    if (-not [string]::IsNullOrEmpty($env:GLAB_MR_GRAPH_ASSET_PATH)) {
-        Copy-Item -LiteralPath $env:GLAB_MR_GRAPH_ASSET_PATH -Destination $tempPath -Force
-    } else {
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $tempPath -UseBasicParsing -TimeoutSec 120
-    }
-    if (-not (Test-Path -LiteralPath $tempPath -PathType Leaf) -or (Get-Item -LiteralPath $tempPath).Length -eq 0) {
-        Stop-Installer 'downloaded release asset is empty'
+    Save-InstallerAsset $env:GLAB_MR_GRAPH_ASSET_PATH $downloadUrl $tempPath
+    if ($installShim) {
+        Save-InstallerAsset $env:GLAB_MR_GRAPH_SHIM_ASSET_PATH $shimDownloadUrl $shimTempPath
     }
 
     if (Test-Path -LiteralPath $binaryPath) {
@@ -150,9 +196,25 @@ try {
     Move-Item -LiteralPath $tempPath -Destination $binaryPath
     $installed = $true
 
+    if ($installShim) {
+        if (Test-Path -LiteralPath $shimPath -PathType Leaf) {
+            $shimBackupPath = Join-Path $runtimeDir ('.glab-mr-graph-shim.backup.{0}.tmp' -f ([guid]::NewGuid().ToString('N')))
+            Move-Item -LiteralPath $shimPath -Destination $shimBackupPath
+        }
+        Move-Item -LiteralPath $shimTempPath -Destination $shimPath
+        $shimInstalled = $true
+        [System.IO.File]::WriteAllText($shimMarker, "managed-v1`n")
+    }
+
     $pathAdded = Add-UserPathEntry $installDir
     if ($markerExisted -or $pathAdded) {
         [System.IO.File]::WriteAllText($pathMarker, "path-added-v1`n")
+    }
+    if ($installShim) {
+        $runtimePathAdded = Add-UserPathEntry $runtimeDir
+        if ($runtimeMarkerExisted -or $runtimePathAdded) {
+            [System.IO.File]::WriteAllText($runtimePathMarker, "path-added-v1`n")
+        }
     }
 
     & glab alias set --shell mr-graph $aliasCommand
@@ -164,7 +226,12 @@ try {
         Remove-Item -LiteralPath $backupPath -Force
         $backupPath = $null
     }
+    if ($null -ne $shimBackupPath) {
+        Remove-Item -LiteralPath $shimBackupPath -Force
+        $shimBackupPath = $null
+    }
     $installed = $false
+    $shimInstalled = $false
 } catch {
     if (Test-Path -LiteralPath $tempPath) {
         Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
@@ -175,14 +242,30 @@ try {
     if ($null -ne $backupPath -and (Test-Path -LiteralPath $backupPath)) {
         Move-Item -LiteralPath $backupPath -Destination $binaryPath -Force -ErrorAction SilentlyContinue
     }
+    if ($shimInstalled -and (Test-Path -LiteralPath $shimPath)) {
+        Remove-Item -LiteralPath $shimPath -Force -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $shimBackupPath -and (Test-Path -LiteralPath $shimBackupPath)) {
+        Move-Item -LiteralPath $shimBackupPath -Destination $shimPath -Force -ErrorAction SilentlyContinue
+    }
     if ($pathAdded -and -not $markerExisted) {
         Remove-UserPathEntry $installDir
         Remove-Item -LiteralPath $pathMarker -Force -ErrorAction SilentlyContinue
+    }
+    if ($runtimePathAdded -and -not $runtimeMarkerExisted) {
+        Remove-UserPathEntry $runtimeDir
+        Remove-Item -LiteralPath $runtimePathMarker -Force -ErrorAction SilentlyContinue
+    }
+    if ($installShim -and -not $shimMarkerExisted) {
+        Remove-Item -LiteralPath $shimMarker -Force -ErrorAction SilentlyContinue
     }
     throw
 } finally {
     if (Test-Path -LiteralPath $tempPath) {
         Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $shimTempPath -and (Test-Path -LiteralPath $shimTempPath)) {
+        Remove-Item -LiteralPath $shimTempPath -Force -ErrorAction SilentlyContinue
     }
 }
 

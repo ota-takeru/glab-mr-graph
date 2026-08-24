@@ -60,6 +60,10 @@ if ($null -eq $requestedInstallDir) {
 $installDir = [System.IO.Path]::GetFullPath($requestedInstallDir).TrimEnd('\', '/')
 $binaryPath = Join-Path $installDir 'glab-mr-graph.exe'
 $pathMarker = Join-Path $installDir '.glab-mr-graph-path-added'
+$runtimeDir = Join-Path $installDir 'runtime'
+$shimPath = Join-Path $runtimeDir 'sh.exe'
+$shimMarker = Join-Path $runtimeDir '.glab-mr-graph-shim-managed'
+$runtimePathMarker = Join-Path $runtimeDir '.glab-mr-graph-path-added'
 $expectedAlias = 'exec glab-mr-graph.exe "$@"'
 
 if ($null -ne (Get-Command glab -ErrorAction SilentlyContinue)) {
@@ -104,4 +108,29 @@ if (Test-Path -LiteralPath $pathMarker -PathType Leaf) {
     } catch {
         Write-UninstallWarning "could not remove $installDir from the user PATH"
     }
+}
+
+if (Test-Path -LiteralPath $shimMarker -PathType Leaf) {
+    try {
+        if (Test-Path -LiteralPath $shimPath -PathType Leaf) {
+            Remove-Item -LiteralPath $shimPath -Force
+            Write-Host "Removed $shimPath"
+        }
+        Remove-Item -LiteralPath $shimMarker -Force
+    } catch {
+        Write-UninstallWarning "could not remove the managed shell runtime at $shimPath"
+    }
+}
+
+if (Test-Path -LiteralPath $runtimePathMarker -PathType Leaf) {
+    try {
+        Remove-UserPathEntry $runtimeDir
+        Remove-Item -LiteralPath $runtimePathMarker -Force
+    } catch {
+        Write-UninstallWarning "could not remove $runtimeDir from the user PATH"
+    }
+}
+
+if (Test-Path -LiteralPath $runtimeDir -PathType Container) {
+    Remove-Item -LiteralPath $runtimeDir -ErrorAction SilentlyContinue
 }
