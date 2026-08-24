@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Remove the Git for Windows requirement by installing a restricted Windows `sh.exe` compatibility shim only when `glab` cannot use an existing shell; preserve shell priority, argument and I/O forwarding, exit codes, transactional upgrades, and safe uninstall ownership.
+
 ## [0.15.0] - 2026-08-24
 
 - Port the graph workspace to GitLab as `glab-mr-graph`, including authenticated `glab api` search, merge-request hydration, approval/pipeline status mapping, and exact project/branch stack discovery.

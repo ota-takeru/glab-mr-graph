@@ -219,22 +219,38 @@ installerはOS/architectureに対応するGitHub Releaseのraw assetをユーザ
 downloadし、`glab alias set --shell mr-graph` で `glab mr-graph` を登録する。
 POSIXは `$XDG_BIN_HOME` または `$HOME/.local/bin`、Windowsは
 `%LOCALAPPDATA%\glab-mr-graph\bin` を既定とし、`GLAB_MR_GRAPH_INSTALL_DIR` で
-上書きできる。WindowsはGit for Windowsの `sh` をdownload前に必須確認し、install先を
-user PATHへ追加する。installerが追加したPATHだけをmarkerで識別してuninstall時に戻す。
+上書きできる。Windowsはinstall先をuser PATHへ追加する。PATH上の `sh`、または
+`git.exe` から解決できるGit for Windowsの `bin\sh.exe` があればそれを優先する。
+どちらもなければWindows Releaseの `windows-shim-<arch>.exe` をinstall先の
+`runtime\sh.exe` として配置し、runtime directoryをuser PATHの末尾へ追加する。
+installerが追加した各PATHだけを個別のmarkerで識別してuninstall時に戻す。
+
+Windows shimは汎用shellを実装しない。現行glabのshell alias呼び出し規約である
+`sh -c <command>` と、引数がある場合の `-- <args...>` を受け、commandがinstaller管理値
+`exec glab-mr-graph.exe "$@"` と完全一致するときだけ、shimの親directoryにある
+`glab-mr-graph.exe` を直接起動する。stdin/stdout/stderrを接続し、childの終了codeを返す。
+新しいconsoleやprocess groupを作らず、Windows consoleのCtrl-Cをchildへ伝播させる。
+それ以外のcommandはPATH上でshim自身より後ろに別の `sh.exe` が見つかる場合だけ転送し、
+なければ限定runtimeであることを明示して127で終了する。任意shell syntaxはparse・実行しない。
 
 `GLAB_MR_GRAPH_VERSION` は既定の `latest` または厳密な `vX.Y.Z` を受け入れる。
-`GLAB_MR_GRAPH_ASSET_PATH` はnetworkを使わないfixture test専用のlocal asset override
-である。downloadはinstall先と同じdirectoryの一時fileへ完了してからbinaryを置換し、
-download失敗時は既存binaryを保持する。再実行は同じpathのbinaryをupgradeし、alias登録に
-失敗した場合もbackupしたbinaryへrollbackする。
+`GLAB_MR_GRAPH_ASSET_PATH` と `GLAB_MR_GRAPH_SHIM_ASSET_PATH` はnetworkを使わない
+fixture test専用のlocal asset overrideである。downloadは各install先の一時fileへ完了してから
+binaryを置換し、download失敗時は既存binaryとshimを保持する。再実行は同じpathのbinaryと
+管理対象shimをupgradeし、alias登録に失敗した場合も両方をbackupからrollbackする。
 
 install/uninstallは `glab alias list` のcommandをinstallerが生成する値と完全一致で確認する。
 別用途の `mr-graph` aliasがある場合、installは衝突として停止し、uninstallはそのaliasを
 保持する。uninstallerが削除する実行fileは選択されたinstall directory直下の
-`glab-mr-graph`（Windowsは `.exe`）だけで、directoryや他のfileは再帰削除しない。
+`glab-mr-graph`（Windowsは `.exe`）と、ownership markerがあるWindows shimだけで、
+directoryや他のfileは再帰削除しない。
 Ubuntuではfake `glab` とlocal POSIX asset、Windowsではfake `glab` とlocal Windows assetを
 使ってalias、引数転送、latest/version pin、install directory override、upgrade、失敗時保持、
-衝突、uninstall、PATH追加・削除をCIで検証する。
+衝突、uninstall、PATH追加・削除をCIで検証する。Windows shimは空白、引用符、Unicode、
+`--hostname`、複数引数、stdin/stdout/stderr、終了code、console process group維持、
+未知command拒否、fallback shell探索をGo testで検証する。glabにnative
+external-command/plugin dispatchが入った場合はshell aliasと
+shimを廃止し、同じ `glab-mr-graph.exe` を直接dispatchする構成へ移行する。
 
 通常の変更では次を実行する。
 

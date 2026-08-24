@@ -21,3 +21,9 @@ for platform in "${platforms[@]}"; do
     -trimpath -ldflags="-s -w -X main.version=$version" \
     -o "$output" ./cmd/glab-mr-graph
 done
+
+for goarch in 386 amd64 arm64; do
+  GOOS=windows GOARCH="$goarch" CGO_ENABLED=0 go build \
+    -trimpath -ldflags="-s -w" \
+    -o "dist/windows-shim-${goarch}.exe" ./cmd/glab-mr-graph-shim
+done

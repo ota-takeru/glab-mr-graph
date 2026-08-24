@@ -37,6 +37,12 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test Windows shell shim
+        run: go test ./cmd/glab-mr-graph-shim
       - name: Test PowerShell installer
         shell: pwsh
         run: ./scripts/install_test.ps1
