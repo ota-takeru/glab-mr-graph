@@ -38,6 +38,10 @@ type PullRequest struct {
 	ReviewDecision      string                `json:"reviewDecision,omitempty"`
 	ReviewApproved      int                   `json:"reviewApproved"`
 	ReviewTotal         int                   `json:"reviewTotal"`
+	ApprovalState       string                `json:"approvalState"`
+	ApprovalRequired    int                   `json:"approvalRequired"`
+	ApprovalRemaining   int                   `json:"approvalRemaining"`
+	ApproverCount       int                   `json:"approverCount"`
 	TeamReviewPending   bool                  `json:"teamReviewPending,omitempty"`
 	ViewerPendingReview bool                  `json:"viewerPendingReview,omitempty"`
 	ReReviewRequested   bool                  `json:"reReviewRequested,omitempty"`

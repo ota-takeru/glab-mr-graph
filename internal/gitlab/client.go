@@ -29,12 +29,21 @@ const (
 	maxConcurrentGitLabRequests = 6
 )
 
-// MaxMRs and MaxDepth are intentionally conservative.  A malformed or very
-// large stack must not turn a refresh into an unbounded API walk.
+// The graph and request limits are intentionally conservative. A malformed or
+// very large stack must not turn a refresh into an unbounded API walk.
 const (
-	defaultMaxMRs   = 500
-	defaultMaxDepth = 20
+	defaultMaxMRs         = 500
+	defaultMaxDepth       = 20
+	defaultMaxRequests    = 1200
+	defaultRequestTimeout = 30 * time.Second
+	defaultRefreshTimeout = 2 * time.Minute
+	mergeRequestsPerPage  = 100
 )
+
+// ErrRequestBudgetExceeded identifies a refresh that reached its subprocess
+// budget. Callers can use errors.Is when they need to distinguish this from an
+// API error returned by glab.
+var ErrRequestBudgetExceeded = errors.New("GitLab request budget exceeded")
 
 // CommandRunner is the small seam between the API client and the glab
 // executable.  Tests can provide a fixture runner without starting a process.
@@ -69,24 +78,60 @@ func (execRunner) Run(ctx context.Context, args []string) ([]byte, error) {
 // DTO.  The graph package intentionally retains its historical PullRequest
 // type so the rendering and layout code can be shared safely.
 type Client struct {
-	Hostname string
-	MaxMRs   int
-	MaxDepth int
-	Runner   CommandRunner
-	Tracer   oteltrace.Tracer
+	Hostname       string
+	MaxMRs         int
+	MaxDepth       int
+	RequestTimeout time.Duration
+	RefreshTimeout time.Duration
+	MaxRequests    int
+	Runner         CommandRunner
+	Tracer         oteltrace.Tracer
 
 	projectMu    sync.Mutex
 	projectCache map[int]*rawProject
+	projectCalls map[int]*projectCall
+}
+
+type projectCall struct {
+	done    chan struct{}
+	project *rawProject
+	err     error
 }
 
 func New(hostname string) *Client {
 	return &Client{
-		Hostname:     hostname,
-		MaxMRs:       defaultMaxMRs,
-		MaxDepth:     defaultMaxDepth,
-		Runner:       execRunner{},
-		projectCache: make(map[int]*rawProject),
+		Hostname:       hostname,
+		MaxMRs:         defaultMaxMRs,
+		MaxDepth:       defaultMaxDepth,
+		RequestTimeout: defaultRequestTimeout,
+		RefreshTimeout: defaultRefreshTimeout,
+		MaxRequests:    defaultMaxRequests,
+		Runner:         execRunner{},
+		projectCache:   make(map[int]*rawProject),
+		projectCalls:   make(map[int]*projectCall),
 	}
+}
+
+type requestBudgetContextKey struct{}
+
+type requestBudget struct {
+	mu    sync.Mutex
+	used  int
+	limit int
+}
+
+func newRequestBudget(limit int) *requestBudget {
+	return &requestBudget{limit: limit}
+}
+
+func (b *requestBudget) acquire() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.used >= b.limit {
+		return false
+	}
+	b.used++
+	return true
 }
 
 type rawUser struct {
@@ -110,8 +155,9 @@ type rawPipeline struct {
 }
 
 type rawApproval struct {
-	ApprovalsRequired int `json:"approvals_required"`
-	ApprovalsLeft     int `json:"approvals_left"`
+	ApprovalsRequired int  `json:"approvals_required"`
+	ApprovalsLeft     int  `json:"approvals_left"`
+	Approved          bool `json:"approved"`
 	ApprovedBy        []struct {
 		User rawUser `json:"user"`
 	} `json:"approved_by"`
@@ -149,6 +195,12 @@ type searchSpec struct {
 	query string
 }
 
+type searchResult struct {
+	items     []rawMergeRequest
+	truncated bool
+	err       error
+}
+
 // buildSearchSpecs maps the three relationship filters to GitLab's global
 // merge-request scopes.  The optional text search is intentionally a fourth
 // OR branch, matching the UI semantics of the original graph.
@@ -169,6 +221,29 @@ func buildSearchSpecs(options graph.SearchOptions) []searchSpec {
 	return result
 }
 
+func (c *Client) searchMergeRequests(ctx context.Context, specs []searchSpec) []searchResult {
+	results := make([]searchResult, len(specs))
+	workers := min(len(specs), maxConcurrentGitLabRequests)
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				items, truncated, err := c.listMergeRequests(ctx, specs[index], c.maxMRs())
+				results[index] = searchResult{items: items, truncated: truncated, err: err}
+			}
+		}()
+	}
+	for index := range specs {
+		jobs <- index
+	}
+	close(jobs)
+	wg.Wait()
+	return results
+}
+
 // Load implements server.Loader.
 func (c *Client) Load(ctx context.Context, options graph.SearchOptions) (graph.Result, error) {
 	return c.LoadProgress(ctx, options, nil)
@@ -176,7 +251,20 @@ func (c *Client) Load(ctx context.Context, options graph.SearchOptions) (graph.R
 
 // LoadProgress searches, hydrates and discovers a bounded merge-request graph.
 func (c *Client) LoadProgress(ctx context.Context, options graph.SearchOptions, progress func(current, total int, phase string, collected int)) (result graph.Result, resultErr error) {
-	ctx, span := c.startSpan(ctx, "load merge request graph", oteltrace.SpanInternal, oteltrace.Attributes{"mr.search_query": options.Query})
+	return c.loadStages(ctx, options, progress, nil)
+}
+
+// LoadStages emits the topology before the slower detail and approval requests
+// finish, then emits the status-rich graph as the complete stage.
+func (c *Client) LoadStages(ctx context.Context, options graph.SearchOptions, progress func(current, total int, phase string, collected int), emit func(stage string, result graph.Result)) (result graph.Result, resultErr error) {
+	return c.loadStages(ctx, options, progress, emit)
+}
+
+func (c *Client) loadStages(ctx context.Context, options graph.SearchOptions, progress func(current, total int, phase string, collected int), emit func(stage string, result graph.Result)) (result graph.Result, resultErr error) {
+	refreshCtx, cancel := context.WithTimeout(ctx, c.refreshTimeout())
+	defer cancel()
+	ctx = context.WithValue(refreshCtx, requestBudgetContextKey{}, newRequestBudget(c.maxRequests()))
+	ctx, span := c.startSpan(ctx, "load merge request graph", oteltrace.SpanInternal, oteltrace.Attributes{"mr.has_search_query": options.Query != ""})
 	if span != nil {
 		defer func() {
 			span.End(resultErr, oteltrace.Attributes{"mr.node_count": len(result.Nodes), "mr.edge_count": len(result.Edges)})
@@ -187,26 +275,43 @@ func (c *Client) LoadProgress(ctx context.Context, options graph.SearchOptions, 
 			progress(current, total, phase, collected)
 		}
 	}
-	viewer, err := c.currentUser(ctx)
-	if err != nil {
-		return graph.Result{}, err
-	}
 	specs := buildSearchSpecs(options)
+	var viewer rawUser
+	var viewerErr error
+	viewerDone := make(chan struct{})
+	go func() {
+		viewer, viewerErr = c.currentUser(ctx)
+		close(viewerDone)
+	}()
 	if len(specs) == 0 {
-		return graph.Build(nil, nil), nil
+		<-viewerDone
+		if viewerErr != nil {
+			return graph.Result{}, viewerErr
+		}
+		result = graph.Build(nil, nil)
+		if emit != nil {
+			emit("topology", result)
+			emit("complete", result)
+		}
+		return result, nil
 	}
 	report(0, len(specs), "Searching merge requests", 0)
-	byID := make(map[string]*graph.PullRequest)
 	rawByID := make(map[string]rawMergeRequest)
+	sourceByID := make(map[string]string)
 	directReview := make(map[string]bool)
 	warnings := make([]string, 0)
 	searchLimitReached := false
-	for i, spec := range specs {
-		rawItems, listErr := c.listMergeRequests(ctx, spec)
-		if listErr != nil {
-			return graph.Result{}, listErr
+	searchResults := c.searchMergeRequests(ctx, specs)
+	<-viewerDone
+	if viewerErr != nil {
+		return graph.Result{}, viewerErr
+	}
+	for i, result := range searchResults {
+		if result.err != nil {
+			return graph.Result{}, result.err
 		}
-		for _, raw := range rawItems {
+		searchLimitReached = searchLimitReached || result.truncated
+		for _, raw := range result.items {
 			if raw.State != "" && raw.State != "opened" {
 				continue
 			}
@@ -218,42 +323,35 @@ func (c *Client) LoadProgress(ctx context.Context, options graph.SearchOptions, 
 				searchLimitReached = true
 				break
 			}
-			if spec.scope == "reviews_for_me" {
+			if specs[i].scope == "reviews_for_me" {
 				directReview[id] = true
 			}
 			if _, exists := rawByID[id]; !exists {
 				rawByID[id] = raw
+				sourceByID[id] = "search"
 			}
 		}
 		report(i+1, len(specs), "Searching merge requests", len(rawByID))
 	}
 
-	// Hydrate search results before constructing graph DTOs.  A failed detail
-	// or approval request does not discard the MR; it only leaves the fields
-	// available from the list response.
 	searchItems := make([]rawMergeRequest, 0, len(rawByID))
 	for _, raw := range rawByID {
 		searchItems = append(searchItems, raw)
 	}
 	sort.Slice(searchItems, func(i, j int) bool { return rawMRID(searchItems[i]) < rawMRID(searchItems[j]) })
-	hydrated, hydrateWarnings := c.hydrateMany(ctx, searchItems)
-	warnings = append(warnings, hydrateWarnings...)
-	for _, item := range hydrated {
-		id := rawMRID(item.mr)
-		pr := c.convert(item.mr, item.approval, viewer.Username, "search")
-		if pr == nil {
-			continue
-		}
-		pr.Relation = graph.RelationFor(pr, viewer.Username, directReview[id] || hasReviewer(item.mr, viewer.Username))
-		byID[id] = pr
+	searchItems, projectWarnings, _ := c.enrichProjectsMany(ctx, searchItems)
+	warnings = append(warnings, projectWarnings...)
+	for _, raw := range searchItems {
+		rawByID[rawMRID(raw)] = raw
 	}
 
-	seeds := make([]*graph.PullRequest, 0, len(byID))
-	for _, pr := range byID {
-		seeds = append(seeds, pr)
+	seedIDs := make([]string, 0, len(rawByID))
+	for id := range rawByID {
+		seedIDs = append(seedIDs, id)
 	}
-	report(0, len(seeds), "Discovering stacked merge requests", len(byID))
-	discovered, discoveryWarnings := c.discoverStacks(ctx, seeds, byID, viewer.Username, report)
+	sort.Strings(seedIDs)
+	report(0, len(seedIDs), "Discovering stacked merge requests", len(rawByID))
+	discovered, discoveryWarnings := c.discoverRawStacks(ctx, seedIDs, rawByID, sourceByID, viewer.Username, report)
 	warnings = append(warnings, discoveryWarnings...)
 	if searchLimitReached {
 		warnings = append(warnings, "Merge request limit reached; narrow the search to see the complete graph.")
@@ -261,11 +359,63 @@ func (c *Client) LoadProgress(ctx context.Context, options graph.SearchOptions, 
 	if discovered {
 		warnings = append(warnings, "Merge request limit reached; narrow the search to see the complete graph.")
 	}
-	prs := make([]*graph.PullRequest, 0, len(byID))
-	for _, pr := range byID {
+	warnings = uniqueWarnings(warnings)
+	topologyPRs := c.convertMany(rawByID, nil, sourceByID, directReview, viewer.Username, true)
+	topology := graph.Build(topologyPRs, warnings)
+	if emit != nil {
+		emit("topology", topology)
+	}
+	report(0, len(rawByID), "Loading merge request status", len(rawByID))
+
+	allItems := make([]rawMergeRequest, 0, len(rawByID))
+	for _, raw := range rawByID {
+		allItems = append(allItems, raw)
+	}
+	sort.Slice(allItems, func(i, j int) bool { return rawMRID(allItems[i]) < rawMRID(allItems[j]) })
+	hydrated, hydrateWarnings, _ := c.hydrateManyDetailed(ctx, allItems)
+	warnings = uniqueWarnings(append(warnings, hydrateWarnings...))
+	finalRaw := make(map[string]rawMergeRequest, len(hydrated))
+	approvals := make(map[string]*rawApproval, len(hydrated))
+	for _, item := range hydrated {
+		id := rawMRID(item.mr)
+		finalRaw[id] = item.mr
+		approvals[id] = item.approval
+	}
+	prs := c.convertMany(finalRaw, approvals, sourceByID, directReview, viewer.Username, false)
+	result = graph.Build(prs, warnings)
+	report(len(rawByID), len(rawByID), "Loading merge request status", len(rawByID))
+	if emit != nil {
+		emit("complete", result)
+	}
+	return result, nil
+}
+
+func (c *Client) convertMany(rawByID map[string]rawMergeRequest, approvals map[string]*rawApproval, sourceByID map[string]string, directReview map[string]bool, viewer string, loading bool) []*graph.PullRequest {
+	ids := make([]string, 0, len(rawByID))
+	for id := range rawByID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	prs := make([]*graph.PullRequest, 0, len(ids))
+	for _, id := range ids {
+		raw := rawByID[id]
+		pr := c.convert(raw, approvals[id], viewer, sourceByID[id])
+		if pr == nil {
+			continue
+		}
+		if loading {
+			pr.ApprovalState = "LOADING"
+			pr.ApprovalRequired = 0
+			pr.ApprovalRemaining = 0
+			pr.ApproverCount = 0
+			pr.ReviewApproved = 0
+			pr.ReviewTotal = 0
+			pr.ReviewDecision = ""
+		}
+		pr.Relation = graph.RelationFor(pr, viewer, directReview[id] || hasReviewer(raw, viewer))
 		prs = append(prs, pr)
 	}
-	return graph.Build(prs, warnings), nil
+	return prs
 }
 
 type hydratedMR struct {
@@ -274,8 +424,13 @@ type hydratedMR struct {
 }
 
 func (c *Client) hydrateMany(ctx context.Context, items []rawMergeRequest) ([]hydratedMR, []string) {
+	ordered, warnings, _ := c.hydrateManyDetailed(ctx, items)
+	return ordered, warnings
+}
+
+func (c *Client) hydrateManyDetailed(ctx context.Context, items []rawMergeRequest) ([]hydratedMR, []string, error) {
 	if len(items) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	workers := maxConcurrentGitLabRequests
 	if len(items) < workers {
@@ -313,20 +468,31 @@ func (c *Client) hydrateMany(ctx context.Context, items []rawMergeRequest) ([]hy
 		wg.Wait()
 		close(responses)
 	}()
+	orderedResponses := make([]response, len(items))
+	for item := range responses {
+		orderedResponses[item.index] = item
+	}
 	ordered := make([]hydratedMR, len(items))
 	warnings := make([]string, 0)
-	for item := range responses {
+	var stopDiscoveryErr error
+	for _, item := range orderedResponses {
 		ordered[item.index] = hydratedMR{mr: item.mr, approval: item.approval}
 		if item.detailErr != nil {
+			if stopDiscoveryErr == nil && c.shouldStopDiscovery(item.detailErr) {
+				stopDiscoveryErr = item.detailErr
+			}
 			warnings = append(warnings, "Some GitLab merge request details could not be loaded; list data was retained.")
 		}
 		if item.approvalErr != nil {
-			// Approval rules are optional (and unavailable on some tiers).  Keep
-			// the MR visible and let the converter fall back to reviewers.
-			warnings = append(warnings, "Some GitLab approval data is unavailable; reviewer counts may be incomplete.")
+			if stopDiscoveryErr == nil && c.shouldStopDiscovery(item.approvalErr) {
+				stopDiscoveryErr = item.approvalErr
+			}
+			// Approval rules are optional (and unavailable on some tiers). Keep
+			// the MR visible and expose the unavailable state in the DTO.
+			warnings = append(warnings, "Some GitLab approval data is unavailable; approval counts may be unavailable.")
 		}
 	}
-	return ordered, uniqueWarnings(warnings)
+	return ordered, uniqueWarnings(warnings), stopDiscoveryErr
 }
 
 func (c *Client) hydrateOne(ctx context.Context, mr rawMergeRequest) (rawMergeRequest, *rawApproval, error, error) {
@@ -334,7 +500,7 @@ func (c *Client) hydrateOne(ctx context.Context, mr rawMergeRequest) (rawMergeRe
 	var detailErr error
 	if mr.TargetProjectID > 0 && mr.IID > 0 {
 		var fetched rawMergeRequest
-		detailErr = c.apiJSON(ctx, "get merge request detail", mergeRequestPath(mr.TargetProjectID, mr.IID), false, &fetched)
+		detailErr = c.apiJSON(ctx, "get merge request detail", mergeRequestPath(mr.TargetProjectID, mr.IID), &fetched)
 		if detailErr == nil && fetched.IID != 0 {
 			detail = mergeRequestOverlay(mr, fetched)
 		}
@@ -356,7 +522,7 @@ func (c *Client) hydrateOne(ctx context.Context, mr rawMergeRequest) (rawMergeRe
 	var approval rawApproval
 	var approvalErr error
 	if detail.TargetProjectID > 0 && detail.IID > 0 {
-		approvalErr = c.apiJSON(ctx, "get merge request approvals", approvalPath(detail.TargetProjectID, detail.IID), false, &approval)
+		approvalErr = c.apiJSON(ctx, "get merge request approvals", approvalPath(detail.TargetProjectID, detail.IID), &approval)
 	}
 	if approvalErr != nil {
 		return detail, nil, detailErr, approvalErr
@@ -441,22 +607,109 @@ type stackItem struct {
 	direction stackDirection
 }
 
-func (c *Client) discoverStacks(ctx context.Context, seeds []*graph.PullRequest, byID map[string]*graph.PullRequest, viewer string, report func(int, int, string, int)) (bool, []string) {
-	frontier := make([]stackItem, 0, len(seeds))
-	for _, seed := range seeds {
-		frontier = append(frontier, stackItem{pr: seed, direction: stackBoth})
+type branchJob struct {
+	search    branchSearch
+	current   *graph.PullRequest
+	direction stackDirection
+	depth     int
+}
+
+type branchResult struct {
+	items     []rawMergeRequest
+	truncated bool
+	err       error
+}
+
+type discoveredCandidate struct {
+	raw       rawMergeRequest
+	current   *graph.PullRequest
+	direction stackDirection
+	depth     int
+}
+
+func (c *Client) enrichProjectsMany(ctx context.Context, items []rawMergeRequest) ([]rawMergeRequest, []string, error) {
+	if len(items) == 0 {
+		return nil, nil, nil
+	}
+	workers := min(len(items), maxConcurrentGitLabRequests)
+	type response struct {
+		index int
+		mr    rawMergeRequest
+		err   error
+	}
+	jobs := make(chan int)
+	responses := make(chan response, len(items))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				mr := items[index]
+				var firstErr error
+				if mr.TargetProject == nil {
+					project, err := c.project(ctx, mr.TargetProjectID)
+					if err != nil {
+						firstErr = err
+					} else {
+						mr.TargetProject = project
+					}
+				}
+				if mr.SourceProject == nil && mr.SourceProjectID != mr.TargetProjectID {
+					project, err := c.project(ctx, mr.SourceProjectID)
+					if err != nil && firstErr == nil {
+						firstErr = err
+					} else if err == nil {
+						mr.SourceProject = project
+					}
+				}
+				responses <- response{index: index, mr: mr, err: firstErr}
+			}
+		}()
+	}
+	go func() {
+		for index := range items {
+			jobs <- index
+		}
+		close(jobs)
+		wg.Wait()
+		close(responses)
+	}()
+	ordered := make([]rawMergeRequest, len(items))
+	warnings := make([]string, 0)
+	var stopErr error
+	for response := range responses {
+		ordered[response.index] = response.mr
+		if response.err != nil {
+			warnings = append(warnings, "Some GitLab project metadata could not be loaded; fallback project names were retained.")
+			if stopErr == nil && c.shouldStopDiscovery(response.err) {
+				stopErr = response.err
+			}
+		}
+	}
+	return ordered, uniqueWarnings(warnings), stopErr
+}
+
+// discoverRawStacks resolves stack identity using list responses and project
+// metadata only. Detail and approval requests are deliberately deferred until
+// after the topology stage has been emitted.
+func (c *Client) discoverRawStacks(ctx context.Context, seedIDs []string, rawByID map[string]rawMergeRequest, sourceByID map[string]string, viewer string, report func(int, int, string, int)) (bool, []string) {
+	frontier := make([]stackItem, 0, len(seedIDs))
+	for _, id := range seedIDs {
+		pr := c.convert(rawByID[id], nil, viewer, sourceByID[id])
+		if pr != nil {
+			frontier = append(frontier, stackItem{pr: pr, direction: stackBoth})
+		}
 	}
 	visitedDownstream := make(map[string]bool)
 	visitedUpstream := make(map[string]bool)
 	warnings := make([]string, 0)
 	limitReached := false
+	stopDiscovery := false
 	processed := 0
 
-	// Direct search seeds can be explored in both directions. A node discovered
-	// upstream or downstream retains that direction, so an upstream parent
-	// cannot make the traversal fan out into its unrelated downstream siblings.
-	for len(frontier) > 0 && len(byID) < c.maxMRs() {
-		next := make([]stackItem, 0)
+	for len(frontier) > 0 && len(rawByID) < c.maxMRs() && !stopDiscovery {
+		jobs := make([]branchJob, 0, len(frontier)*2)
 		for _, current := range frontier {
 			processed++
 			if current.depth >= c.maxDepth() {
@@ -466,36 +719,234 @@ func (c *Client) discoverStacks(ctx context.Context, seeds []*graph.PullRequest,
 				key := refKey(current.pr.HeadRepositoryID, current.pr.HeadRefName)
 				if !visitedDownstream[key] {
 					visitedDownstream[key] = true
-					rawItems, err := c.listBranchMergeRequests(ctx, branchSearch{projectID: current.pr.HeadRepositoryID, targetBranch: current.pr.HeadRefName})
-					if err != nil {
-						warnings = append(warnings, "Could not discover downstream GitLab merge requests for a stack branch.")
-					} else {
-						added, limit := c.addDiscovered(ctx, rawItems, byID, viewer, "downstream", stackDownstream, current.depth+1, &next, current.pr)
-						if added > 0 {
-							report(processed, max(1, len(seeds)), "Discovering stacked merge requests", len(byID))
-						}
-						limitReached = limitReached || limit
-					}
+					jobs = append(jobs, branchJob{search: branchSearch{projectID: current.pr.HeadRepositoryID, targetBranch: current.pr.HeadRefName}, current: current.pr, direction: stackDownstream, depth: current.depth + 1})
+				}
+			}
+			if (current.direction == stackBoth || current.direction == stackUpstream) && current.pr.RepositoryID != "" && current.pr.BaseRefName != "" && current.pr.DefaultBranch != "" && current.pr.BaseRefName != current.pr.DefaultBranch {
+				key := refKey(current.pr.RepositoryID, current.pr.BaseRefName)
+				if !visitedUpstream[key] {
+					visitedUpstream[key] = true
+					jobs = append(jobs, branchJob{search: branchSearch{projectID: current.pr.RepositoryID, sourceBranch: current.pr.BaseRefName}, current: current.pr, direction: stackUpstream, depth: current.depth + 1})
+				}
+			}
+		}
+		if len(jobs) == 0 {
+			break
+		}
+		remaining := c.maxMRs() - len(rawByID)
+		results := c.listBranchJobs(ctx, jobs, remaining)
+		candidates := make([]discoveredCandidate, 0)
+		candidateByID := make(map[string]bool)
+		for index, result := range results {
+			job := jobs[index]
+			if result.truncated {
+				limitReached = true
+			}
+			if result.err != nil {
+				if c.shouldStopDiscovery(result.err) {
+					warnings = append(warnings, c.discoveryStopWarning(result.err))
+					stopDiscovery = true
+				} else if job.direction == stackDownstream {
+					warnings = append(warnings, "Could not discover downstream GitLab merge requests for a stack branch.")
+				} else {
+					warnings = append(warnings, "Could not discover upstream GitLab merge requests for a stack branch.")
+				}
+				continue
+			}
+			for _, raw := range result.items {
+				id := rawMRID(raw)
+				_, exists := rawByID[id]
+				if id == "" || id == job.current.ID || exists || candidateByID[id] || !matchesBranchCandidate(raw, job.current, job.direction) {
+					continue
+				}
+				if len(candidates) >= remaining {
+					limitReached = true
+					continue
+				}
+				candidateByID[id] = true
+				candidates = append(candidates, discoveredCandidate{raw: raw, current: job.current, direction: job.direction, depth: job.depth})
+			}
+		}
+		if len(candidates) == 0 {
+			frontier = nil
+			continue
+		}
+		rawItems := make([]rawMergeRequest, len(candidates))
+		for i, candidate := range candidates {
+			rawItems[i] = candidate.raw
+		}
+		enriched, projectWarnings, projectStopErr := c.enrichProjectsMany(ctx, rawItems)
+		warnings = append(warnings, projectWarnings...)
+		if projectStopErr != nil {
+			warnings = append(warnings, c.discoveryStopWarning(projectStopErr))
+			stopDiscovery = true
+		}
+		next := make([]stackItem, 0, len(enriched))
+		for i, raw := range enriched {
+			if len(rawByID) >= c.maxMRs() {
+				limitReached = true
+				break
+			}
+			candidate := candidates[i]
+			id := rawMRID(raw)
+			if _, exists := rawByID[id]; id == "" || exists {
+				continue
+			}
+			pr := c.convert(raw, nil, viewer, stackSource(candidate.direction))
+			if pr == nil {
+				continue
+			}
+			if candidate.direction == stackDownstream {
+				if !isDownstreamChild(candidate.current, pr) {
+					continue
+				}
+			} else if !isUpstreamParent(pr, candidate.current) {
+				continue
+			}
+			rawByID[id] = raw
+			sourceByID[id] = stackSource(candidate.direction)
+			next = append(next, stackItem{pr: pr, depth: candidate.depth, direction: candidate.direction})
+		}
+		if len(next) > 0 && report != nil {
+			report(processed, max(1, len(seedIDs)), "Discovering stacked merge requests", len(rawByID))
+		}
+		frontier = next
+	}
+	if len(rawByID) >= c.maxMRs() {
+		limitReached = true
+	}
+	return limitReached, uniqueWarnings(warnings)
+}
+
+func (c *Client) discoverStacks(ctx context.Context, seeds []*graph.PullRequest, byID map[string]*graph.PullRequest, viewer string, report func(int, int, string, int)) (bool, []string) {
+	frontier := make([]stackItem, 0, len(seeds))
+	for _, seed := range seeds {
+		frontier = append(frontier, stackItem{pr: seed, direction: stackBoth})
+	}
+	visitedDownstream := make(map[string]bool)
+	visitedUpstream := make(map[string]bool)
+	warnings := make([]string, 0)
+	limitReached := false
+	stopDiscovery := false
+	processed := 0
+
+	// Direct search seeds can be explored in both directions. A node discovered
+	// upstream or downstream retains that direction, so an upstream parent
+	// cannot make the traversal fan out into its unrelated downstream siblings.
+	for len(frontier) > 0 && len(byID) < c.maxMRs() && !stopDiscovery {
+		jobs := make([]branchJob, 0, len(frontier)*2)
+		for _, current := range frontier {
+			processed++
+			if current.depth >= c.maxDepth() {
+				continue
+			}
+			if (current.direction == stackBoth || current.direction == stackDownstream) && current.pr.HeadRepositoryID != "" && current.pr.HeadRefName != "" {
+				key := refKey(current.pr.HeadRepositoryID, current.pr.HeadRefName)
+				if !visitedDownstream[key] {
+					visitedDownstream[key] = true
+					jobs = append(jobs, branchJob{
+						search:  branchSearch{projectID: current.pr.HeadRepositoryID, targetBranch: current.pr.HeadRefName},
+						current: current.pr, direction: stackDownstream, depth: current.depth + 1,
+					})
 				}
 			}
 			if (current.direction == stackBoth || current.direction == stackUpstream) && current.pr.RepositoryID != "" && current.pr.BaseRefName != "" && current.pr.BaseRefName != current.pr.DefaultBranch {
 				key := refKey(current.pr.RepositoryID, current.pr.BaseRefName)
 				if !visitedUpstream[key] {
 					visitedUpstream[key] = true
-					rawItems, err := c.listBranchMergeRequests(ctx, branchSearch{projectID: current.pr.RepositoryID, sourceBranch: current.pr.BaseRefName})
-					if err != nil {
-						warnings = append(warnings, "Could not discover upstream GitLab merge requests for a stack branch.")
-					} else {
-						added, limit := c.addDiscovered(ctx, rawItems, byID, viewer, "upstream", stackUpstream, current.depth+1, &next, current.pr)
-						if added > 0 {
-							report(processed, max(1, len(seeds)), "Discovering stacked merge requests", len(byID))
-						}
-						limitReached = limitReached || limit
-					}
+					jobs = append(jobs, branchJob{
+						search:  branchSearch{projectID: current.pr.RepositoryID, sourceBranch: current.pr.BaseRefName},
+						current: current.pr, direction: stackUpstream, depth: current.depth + 1,
+					})
 				}
 			}
 		}
-		frontier = next
+		if len(jobs) == 0 {
+			break
+		}
+		remaining := c.maxMRs() - len(byID)
+		results := c.listBranchJobs(ctx, jobs, remaining)
+		candidates := make([]discoveredCandidate, 0)
+		candidateByID := make(map[string]bool)
+		for index, result := range results {
+			job := jobs[index]
+			if result.truncated {
+				limitReached = true
+			}
+			if result.err != nil {
+				if c.shouldStopDiscovery(result.err) {
+					warnings = append(warnings, c.discoveryStopWarning(result.err))
+					stopDiscovery = true
+				} else if job.direction == stackDownstream {
+					warnings = append(warnings, "Could not discover downstream GitLab merge requests for a stack branch.")
+				} else {
+					warnings = append(warnings, "Could not discover upstream GitLab merge requests for a stack branch.")
+				}
+				continue
+			}
+			for _, raw := range result.items {
+				id := rawMRID(raw)
+				if id == "" || id == job.current.ID || byID[id] != nil || candidateByID[id] {
+					continue
+				}
+				if !matchesBranchCandidate(raw, job.current, job.direction) {
+					continue
+				}
+				if len(candidates) >= remaining {
+					limitReached = true
+					continue
+				}
+				candidateByID[id] = true
+				candidates = append(candidates, discoveredCandidate{raw: raw, current: job.current, direction: job.direction, depth: job.depth})
+			}
+		}
+
+		if len(candidates) > 0 {
+			rawItems := make([]rawMergeRequest, len(candidates))
+			for i, candidate := range candidates {
+				rawItems[i] = candidate.raw
+			}
+			hydrated, hydrationWarnings, hydrationStopErr := c.hydrateManyDetailed(ctx, rawItems)
+			warnings = append(warnings, hydrationWarnings...)
+			if hydrationStopErr != nil {
+				warnings = append(warnings, c.discoveryStopWarning(hydrationStopErr))
+				stopDiscovery = true
+			}
+			next := make([]stackItem, 0, len(hydrated))
+			added := 0
+			for i, item := range hydrated {
+				if len(byID) >= c.maxMRs() {
+					limitReached = true
+					break
+				}
+				candidate := candidates[i]
+				id := rawMRID(item.mr)
+				if id == "" || byID[id] != nil {
+					continue
+				}
+				pr := c.convert(item.mr, item.approval, viewer, stackSource(candidate.direction))
+				if pr == nil {
+					continue
+				}
+				if candidate.direction == stackDownstream {
+					if !isDownstreamChild(candidate.current, pr) {
+						continue
+					}
+				} else if !isUpstreamParent(pr, candidate.current) {
+					continue
+				}
+				pr.Relation = graph.RelationFor(pr, viewer, hasReviewer(item.mr, viewer))
+				byID[id] = pr
+				next = append(next, stackItem{pr: pr, depth: candidate.depth, direction: candidate.direction})
+				added++
+			}
+			if added > 0 && report != nil {
+				report(processed, max(1, len(seeds)), "Discovering stacked merge requests", len(byID))
+			}
+			frontier = next
+			continue
+		}
+		frontier = nil
 	}
 	if len(byID) >= c.maxMRs() {
 		limitReached = true
@@ -509,53 +960,44 @@ type branchSearch struct {
 	targetBranch string
 }
 
-func (c *Client) addDiscovered(ctx context.Context, rawItems []rawMergeRequest, byID map[string]*graph.PullRequest, viewer, source string, direction stackDirection, depth int, next *[]stackItem, current *graph.PullRequest) (int, bool) {
-	added, limitReached := 0, false
-	for _, raw := range rawItems {
-		if len(byID) >= c.maxMRs() {
-			limitReached = true
-			break
-		}
-		id := rawMRID(raw)
-		if id == "" || id == current.ID {
-			continue
-		}
-		// The API query narrows candidates, but this second check is what
-		// protects against GitLab versions that ignore one of the branch
-		// filters and against same-named branches in forks.
-		if source == "downstream" {
-			if strconv.Itoa(raw.TargetProjectID) != current.HeadRepositoryID || raw.TargetBranch != current.HeadRefName {
-				continue
-			}
-		} else {
-			if strconv.Itoa(raw.SourceProjectID) != current.RepositoryID || raw.SourceBranch != current.BaseRefName || strconv.Itoa(raw.TargetProjectID) != current.RepositoryID {
-				continue
-			}
-		}
-		if _, exists := byID[id]; exists {
-			continue
-		}
-		items, _ := c.hydrateMany(ctx, []rawMergeRequest{raw})
-		if len(items) == 0 {
-			continue
-		}
-		pr := c.convert(items[0].mr, items[0].approval, viewer, source)
-		if pr == nil {
-			continue
-		}
-		if source == "downstream" {
-			if !isDownstreamChild(current, pr) {
-				continue
-			}
-		} else if !isUpstreamParent(pr, current) {
-			continue
-		}
-		pr.Relation = graph.RelationFor(pr, viewer, hasReviewer(items[0].mr, viewer))
-		byID[id] = pr
-		*next = append(*next, stackItem{pr: pr, depth: depth, direction: direction})
-		added++
+func (c *Client) listBranchJobs(ctx context.Context, jobs []branchJob, limit int) []branchResult {
+	results := make([]branchResult, len(jobs))
+	if len(jobs) == 0 || limit <= 0 {
+		return results
 	}
-	return added, limitReached
+	workers := min(len(jobs), maxConcurrentGitLabRequests)
+	indexes := make(chan int)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range indexes {
+				items, truncated, err := c.listBranchMergeRequests(ctx, jobs[index].search, limit)
+				results[index] = branchResult{items: items, truncated: truncated, err: err}
+			}
+		}()
+	}
+	for index := range jobs {
+		indexes <- index
+	}
+	close(indexes)
+	wg.Wait()
+	return results
+}
+
+func matchesBranchCandidate(raw rawMergeRequest, current *graph.PullRequest, direction stackDirection) bool {
+	if direction == stackDownstream {
+		return strconv.Itoa(raw.TargetProjectID) == current.HeadRepositoryID && raw.TargetBranch == current.HeadRefName
+	}
+	return strconv.Itoa(raw.SourceProjectID) == current.RepositoryID && raw.SourceBranch == current.BaseRefName
+}
+
+func stackSource(direction stackDirection) string {
+	if direction == stackDownstream {
+		return "downstream"
+	}
+	return "upstream"
 }
 
 func (c *Client) maxMRs() int {
@@ -569,6 +1011,38 @@ func (c *Client) maxDepth() int {
 		return c.MaxDepth
 	}
 	return defaultMaxDepth
+}
+
+func (c *Client) maxRequests() int {
+	if c.MaxRequests > 0 {
+		return c.MaxRequests
+	}
+	return defaultMaxRequests
+}
+
+func (c *Client) requestTimeout() time.Duration {
+	if c.RequestTimeout > 0 {
+		return c.RequestTimeout
+	}
+	return defaultRequestTimeout
+}
+
+func (c *Client) refreshTimeout() time.Duration {
+	if c.RefreshTimeout > 0 {
+		return c.RefreshTimeout
+	}
+	return defaultRefreshTimeout
+}
+
+func (c *Client) shouldStopDiscovery(err error) bool {
+	return errors.Is(err, ErrRequestBudgetExceeded) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func (c *Client) discoveryStopWarning(err error) string {
+	if errors.Is(err, ErrRequestBudgetExceeded) {
+		return "GitLab request budget exhausted; stack discovery stopped."
+	}
+	return "GitLab refresh timed out or was canceled; stack discovery stopped."
 }
 
 func refKey(projectID, branch string) string { return projectID + "\x00" + branch }
@@ -595,36 +1069,73 @@ func queryPath(path string, values url.Values) string {
 	return path + "?" + values.Encode()
 }
 
-func (c *Client) listMergeRequests(ctx context.Context, spec searchSpec) ([]rawMergeRequest, error) {
-	values := url.Values{"per_page": {"100"}, "scope": {spec.scope}, "state": {"opened"}}
+func (c *Client) listMergeRequests(ctx context.Context, spec searchSpec, limit int) ([]rawMergeRequest, bool, error) {
+	values := url.Values{"per_page": {strconv.Itoa(mergeRequestsPerPage)}, "scope": {spec.scope}, "state": {"opened"}}
 	if spec.query != "" {
 		values.Set("search", spec.query)
 	}
-	return c.listAPI(ctx, "list merge requests", queryPath("/merge_requests", values))
+	return c.listAPI(ctx, "list merge requests", queryPath("/merge_requests", values), limit)
 }
 
-func (c *Client) listBranchMergeRequests(ctx context.Context, search branchSearch) ([]rawMergeRequest, error) {
-	values := url.Values{"per_page": {"100"}, "state": {"opened"}}
+func (c *Client) listBranchMergeRequests(ctx context.Context, search branchSearch, limit int) ([]rawMergeRequest, bool, error) {
+	values := url.Values{"per_page": {strconv.Itoa(mergeRequestsPerPage)}, "state": {"opened"}}
+	path := "/projects/" + url.PathEscape(search.projectID) + "/merge_requests"
 	if search.sourceBranch != "" {
+		// A child may target a project while its parent targets a different
+		// project. Search globally, then validate the source project and branch
+		// against the child after decoding the response.
+		path = "/merge_requests"
+		values.Set("scope", "all")
 		values.Set("source_branch", search.sourceBranch)
 	}
 	if search.targetBranch != "" {
 		values.Set("target_branch", search.targetBranch)
 	}
-	return c.listAPI(ctx, "list stacked merge requests", queryPath("/projects/"+url.PathEscape(search.projectID)+"/merge_requests", values))
+	return c.listAPI(ctx, "list stacked merge requests", queryPath(path, values), limit)
 }
 
-func (c *Client) listAPI(ctx context.Context, operation, endpoint string) ([]rawMergeRequest, error) {
-	var pages []rawMergeRequest
-	if err := c.apiJSON(ctx, operation, endpoint, true, &pages); err != nil {
-		return nil, err
+func (c *Client) listAPI(ctx context.Context, operation, endpoint string, limit int) ([]rawMergeRequest, bool, error) {
+	if limit <= 0 {
+		return nil, false, nil
 	}
-	return pages, nil
+	items := make([]rawMergeRequest, 0, min(limit, mergeRequestsPerPage))
+	for page := 1; ; page++ {
+		pageEndpoint, err := pagedEndpoint(endpoint, page)
+		if err != nil {
+			return nil, false, fmt.Errorf("build GitLab pagination endpoint: %w", err)
+		}
+		var pageItems []rawMergeRequest
+		if err := c.apiJSON(ctx, operation, pageEndpoint, &pageItems); err != nil {
+			return nil, false, err
+		}
+		remaining := limit - len(items)
+		if len(pageItems) >= remaining {
+			items = append(items, pageItems[:remaining]...)
+			truncated := len(pageItems) > remaining || len(pageItems) == mergeRequestsPerPage
+			return items, truncated, nil
+		}
+		items = append(items, pageItems...)
+		if len(pageItems) < mergeRequestsPerPage {
+			return items, false, nil
+		}
+	}
+}
+
+func pagedEndpoint(endpoint string, page int) (string, error) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "", err
+	}
+	values := parsed.Query()
+	values.Set("per_page", strconv.Itoa(mergeRequestsPerPage))
+	values.Set("page", strconv.Itoa(page))
+	parsed.RawQuery = values.Encode()
+	return parsed.String(), nil
 }
 
 func (c *Client) currentUser(ctx context.Context) (rawUser, error) {
 	var user rawUser
-	if err := c.apiJSON(ctx, "get current GitLab user", "/user", false, &user); err != nil {
+	if err := c.apiJSON(ctx, "get current GitLab user", "/user", &user); err != nil {
 		return rawUser{}, err
 	}
 	if user.Username == "" {
@@ -633,21 +1144,25 @@ func (c *Client) currentUser(ctx context.Context) (rawUser, error) {
 	return user, nil
 }
 
-func (c *Client) apiJSON(ctx context.Context, operation, endpoint string, paginate bool, target any) error {
-	args := []string{"api"}
-	if paginate {
-		args = append(args, "--paginate")
+func (c *Client) apiJSON(ctx context.Context, operation, endpoint string, target any) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
+	if budget, ok := ctx.Value(requestBudgetContextKey{}).(*requestBudget); ok && !budget.acquire() {
+		return fmt.Errorf("%w while %s", ErrRequestBudgetExceeded, operation)
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, c.requestTimeout())
+	defer cancel()
+	args := []string{"api"}
 	if c.Hostname != "" {
 		args = append(args, "--hostname", c.Hostname)
 	}
 	args = append(args, endpoint)
-	_, span := c.startSpan(ctx, "glab api: "+operation, oteltrace.SpanClient, oteltrace.Attributes{
+	_, span := c.startSpan(requestCtx, "glab api request", oteltrace.SpanClient, oteltrace.Attributes{
 		"process.executable.name": "glab",
-		"process.command_args":    safeCommandArgs(args),
 		"gitlab.operation.name":   operation,
 	})
-	out, err := c.runner().Run(ctx, args)
+	out, err := c.runner().Run(requestCtx, args)
 	if span != nil {
 		span.End(err, nil)
 	}
@@ -660,12 +1175,6 @@ func (c *Client) apiJSON(ctx context.Context, operation, endpoint string, pagina
 	return nil
 }
 
-func safeCommandArgs(args []string) []string {
-	result := make([]string, len(args))
-	copy(result, args)
-	return result
-}
-
 func (c *Client) runner() CommandRunner {
 	if c.Runner != nil {
 		return c.Runner
@@ -673,9 +1182,9 @@ func (c *Client) runner() CommandRunner {
 	return execRunner{}
 }
 
-// decodeJSONPages accepts both one JSON value and the newline-separated JSON
-// arrays emitted by glab api --paginate.  Keeping it independent of the
-// command runner makes pagination fixtures straightforward to write.
+// decodeJSONPages accepts one JSON value and, for compatibility with older
+// fixtures, newline-separated JSON arrays. Manual pagination only supplies one
+// page per command invocation.
 func decodeJSONPages(data []byte, target any) error {
 	trimmed := bytes.TrimSpace(data)
 	if len(trimmed) == 0 {
@@ -726,15 +1235,46 @@ func (c *Client) project(ctx context.Context, id int) (*rawProject, error) {
 	if c.projectCache == nil {
 		c.projectCache = make(map[int]*rawProject)
 	}
+	if call := c.projectCalls[id]; call != nil {
+		c.projectMu.Unlock()
+		select {
+		case <-call.done:
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if call.project == nil {
+				return nil, call.err
+			}
+			copy := *call.project
+			return &copy, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if c.projectCalls == nil {
+		c.projectCalls = make(map[int]*projectCall)
+	}
+	call := &projectCall{done: make(chan struct{})}
+	c.projectCalls[id] = call
 	c.projectMu.Unlock()
+
 	var project rawProject
-	if err := c.apiJSON(ctx, "get GitLab project", "/projects/"+strconv.Itoa(id), false, &project); err != nil {
+	err := c.apiJSON(ctx, "get GitLab project", "/projects/"+strconv.Itoa(id), &project)
+	c.projectMu.Lock()
+	call.err = err
+	if err == nil {
+		cached := project
+		call.project = &cached
+		c.projectCache[id] = &cached
+	}
+	delete(c.projectCalls, id)
+	close(call.done)
+	c.projectMu.Unlock()
+	if err != nil {
 		return nil, err
 	}
-	c.projectMu.Lock()
-	c.projectCache[id] = &project
-	c.projectMu.Unlock()
-	return &project, nil
+	result := project
+	return &result, nil
 }
 
 func (c *Client) convert(raw rawMergeRequest, approval *rawApproval, viewer, source string) *graph.PullRequest {
@@ -754,6 +1294,7 @@ func (c *Client) convert(raw rawMergeRequest, approval *rawApproval, viewer, sou
 			sourceProject = target
 		}
 	}
+	approvalState, approvalRequired, approvalRemaining, approverCount := approvalFields(approval)
 	pr := &graph.PullRequest{
 		ID: id, Number: raw.IID, Title: raw.Title, URL: raw.WebURL, IsDraft: raw.Draft || raw.WorkInProgress,
 		UpdatedAt: raw.UpdatedAt, RepositoryID: strconv.Itoa(raw.TargetProjectID), Repository: target.PathWithNamespace, RepositoryURL: target.WebURL, Provider: "gitlab",
@@ -761,6 +1302,7 @@ func (c *Client) convert(raw rawMergeRequest, approval *rawApproval, viewer, sou
 		HeadRepositoryID: strconv.Itoa(raw.SourceProjectID), HeadRepository: sourceProject.PathWithNamespace,
 		Assignees: make([]graph.User, 0, len(raw.Assignees)), Relation: "other", Source: source,
 		CIState: pipelineState(raw), Mergeable: mergeState(raw), ReviewDecision: approvalDecision(approval),
+		ApprovalState: approvalState, ApprovalRequired: approvalRequired, ApprovalRemaining: approvalRemaining, ApproverCount: approverCount,
 	}
 	if pr.HeadRepositoryID == "0" || pr.HeadRepositoryID == "" {
 		pr.HeadRepositoryID = pr.RepositoryID
@@ -775,21 +1317,10 @@ func (c *Client) convert(raw rawMergeRequest, approval *rawApproval, viewer, sou
 	for _, assignee := range raw.Assignees {
 		pr.Assignees = append(pr.Assignees, graph.User{Login: gitlabLogin(assignee), AvatarURL: assignee.AvatarURL})
 	}
-	if approval != nil {
-		pr.ReviewApproved = len(approval.ApprovedBy)
-		pr.ReviewTotal = approval.ApprovalsRequired
-		if pr.ReviewTotal == 0 && len(raw.Reviewers) > 0 {
-			pr.ReviewTotal = len(raw.Reviewers)
-		}
-		if pr.ReviewApproved == 0 && approval.ApprovalsRequired > 0 && approval.ApprovalsLeft <= approval.ApprovalsRequired {
-			pr.ReviewApproved = approval.ApprovalsRequired - approval.ApprovalsLeft
-		}
-	} else {
-		pr.ReviewTotal = len(raw.Reviewers)
-	}
-	if pr.ReviewTotal < pr.ReviewApproved {
-		pr.ReviewTotal = pr.ReviewApproved
-	}
+	// Keep the historical fields populated for consumers that still decode
+	// them, but never infer approval-rule satisfaction from approved_by.
+	pr.ReviewApproved = approverCount
+	pr.ReviewTotal = approvalRequired
 	pr.Relation = graph.RelationFor(pr, viewer, hasReviewer(raw, viewer))
 	return pr
 }
@@ -848,20 +1379,35 @@ func mergeState(mr rawMergeRequest) string {
 	}
 }
 
-func approvalDecision(approval *rawApproval) string {
-	if approval == nil || approval.ApprovalsRequired <= 0 {
-		return ""
+func approvalFields(approval *rawApproval) (state string, required, remaining, approverCount int) {
+	if approval == nil {
+		return "UNAVAILABLE", 0, 0, 0
 	}
-	if approval.ApprovalsLeft <= 0 {
+	required = approval.ApprovalsRequired
+	remaining = approval.ApprovalsLeft
+	approverCount = len(approval.ApprovedBy)
+	if required <= 0 {
+		return "NOT_REQUIRED", required, remaining, approverCount
+	}
+	if approval.Approved || remaining <= 0 {
+		return "APPROVED", required, remaining, approverCount
+	}
+	return "PENDING", required, remaining, approverCount
+}
+
+func approvalDecision(approval *rawApproval) string {
+	state, _, _, _ := approvalFields(approval)
+	if state == "APPROVED" {
 		return "APPROVED"
 	}
 	return ""
 }
 
-// isUpstreamParent enforces both sides of the GitLab project/branch identity.
-// In particular, an identically named branch in a fork is never accepted.
+// isUpstreamParent enforces the source project/branch side of the GitLab
+// project/branch identity. The parent's target project may be another
+// project, as in a valid cross-project fork MR.
 func isUpstreamParent(parent, child *graph.PullRequest) bool {
-	return parent.HeadRepositoryID != "" && parent.HeadRepositoryID == child.RepositoryID && parent.HeadRefName == child.BaseRefName && parent.RepositoryID == child.RepositoryID
+	return parent.HeadRepositoryID != "" && parent.HeadRepositoryID == child.RepositoryID && parent.HeadRefName == child.BaseRefName
 }
 
 // isDownstreamChild is the corresponding exact identity check for a child MR.
@@ -871,6 +1417,13 @@ func isDownstreamChild(parent, child *graph.PullRequest) bool {
 
 func max(a, b int) int {
 	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
 		return a
 	}
 	return b

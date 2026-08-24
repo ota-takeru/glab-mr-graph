@@ -3,6 +3,8 @@ package oteltrace
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -64,7 +66,7 @@ func TestExporterPreservesParentChildRelationship(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
 	})
 	ctx, root := exporter.Start(context.Background(), "GET /api/v1/graph", SpanServer, nil)
-	_, child := exporter.Start(ctx, "gh api graphql: search", SpanClient, Attributes{"process.command_args": []string{"gh", "api", "graphql", "-F", "owner=orangain"}})
+	_, child := exporter.Start(ctx, "glab api request", SpanClient, Attributes{"gitlab.operation.name": "search"})
 	child.End(nil, Attributes{"process.exit.code": 0})
 	root.End(nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -86,8 +88,56 @@ func TestExporterPreservesParentChildRelationship(t *testing.T) {
 		t.Errorf("child parentSpanId = %v, root spanId = %v", childSpan["parentSpanId"], rootSpan["spanId"])
 	}
 	encoded, _ := json.Marshal(payload)
-	if !strings.Contains(string(encoded), "owner=orangain") {
-		t.Errorf("payload does not contain command arguments: %s", encoded)
+	if strings.Contains(string(encoded), "command_args") || strings.Contains(string(encoded), "owner=orangain") {
+		t.Errorf("payload contains private command arguments: %s", encoded)
+	}
+}
+
+func TestExporterDoesNotExportErrorMessage(t *testing.T) {
+	const secret = "private-token-branch-secret-endpoint"
+	received := make(chan map[string]any, 1)
+	exporter, err := New("http://collector.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exporter.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		received <- body
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	_, span := exporter.Start(context.Background(), "glab api request", SpanClient, Attributes{"gitlab.operation.name": "detail"})
+	span.End(errors.New(secret), nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := exporter.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := <-received
+	encoded, _ := json.Marshal(payload)
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("exported payload contains the error message: %s", encoded)
+	}
+	spans := payloadSpans(t, payload)
+	if len(spans) != 1 {
+		t.Fatalf("exported spans = %d, want 1", len(spans))
+	}
+	status, ok := spans[0]["status"].(map[string]any)
+	if !ok {
+		t.Fatalf("status = %#v, want object", spans[0]["status"])
+	}
+	if got := status["code"]; got != float64(2) {
+		t.Errorf("status code = %#v, want 2", got)
+	}
+	if _, ok := status["message"]; ok {
+		t.Error("error status unexpectedly contains a message")
+	}
+	attrs := spans[0]["attributes"]
+	if !strings.Contains(fmt.Sprint(attrs), "error.type") || !strings.Contains(fmt.Sprint(attrs), "_OTHER") {
+		t.Errorf("error.type attribute = %#v, want fixed _OTHER", attrs)
 	}
 }
 

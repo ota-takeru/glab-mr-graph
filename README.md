@@ -17,6 +17,8 @@ artifacts are GitLab-specific.
 
 - [GitLab CLI (`glab`)](https://gitlab.com/gitlab-org/cli), authenticated with
   `glab auth login`
+- Git for Windows when installing on Windows, with its `sh` on `PATH` (`glab`
+  runs shell aliases through `sh`)
 - Go 1.23 or newer when building from source
 
 The authenticated `glab` configuration supplies the token for GitLab.com or a
@@ -25,7 +27,54 @@ the browser or written to disk.
 
 ## Install and run
 
-Download a release binary named `glab-mr-graph`, or build it locally:
+The installer downloads the release binary into your user account and registers
+a managed `glab` shell alias. Review the linked installer before piping remote
+code into a shell. These commands become usable after the first GitLab version
+of this project is published in GitHub Releases; until then, build from source
+as shown below. On macOS, Linux, or FreeBSD:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ota-takeru/glab-mr-graph/main/scripts/install.sh | sh
+glab mr-graph
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/ota-takeru/glab-mr-graph/main/scripts/install.ps1 | iex
+glab mr-graph
+```
+
+The POSIX installer uses `$XDG_BIN_HOME`, or `~/.local/bin` when it is unset.
+The Windows installer uses `%LOCALAPPDATA%\glab-mr-graph\bin` and adds that exact
+directory to the user `PATH`. Override either location with
+`GLAB_MR_GRAPH_INSTALL_DIR`. Set `GLAB_MR_GRAPH_VERSION` to a published release
+tag matching `vX.Y.Z` to pin a version; the default is the latest release.
+Running the installer again upgrades the binary in place.
+
+The installer refuses to replace an existing `mr-graph` alias unless it exactly
+matches the alias managed for this installation. It downloads to a temporary
+file before replacing the binary, so a failed download leaves the installed
+version intact.
+
+To uninstall on macOS, Linux, or FreeBSD:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ota-takeru/glab-mr-graph/main/scripts/uninstall.sh | sh
+```
+
+On Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/ota-takeru/glab-mr-graph/main/scripts/uninstall.ps1 | iex
+```
+
+Uninstall removes only the managed alias and the binary at the configured
+install path. On Windows it also removes a `PATH` entry only when that entry was
+added by the installer. An unrelated `mr-graph` alias is preserved.
+
+You can also download a release asset named for the target platform, or build
+the standalone binary locally:
 
 ```sh
 make build
@@ -44,7 +93,7 @@ Press Ctrl-C to stop it.
 For example:
 
 ```sh
-./glab-mr-graph --hostname gitlab.example.com --no-open
+glab mr-graph --hostname gitlab.example.com --no-open
 ```
 
 The Authored, Assigned, and Review requested filters are OR conditions. The
@@ -54,8 +103,9 @@ search.
 
 MR node backgrounds show why an MR is in the workspace: blue means authored,
 cyan means assigned, green means review requested, and gray means related
-stack context. Draft/ready state, approval counts, pipeline status, and merge
-conflicts are shown independently. The UI is read-only in this first GitLab
+stack context. Draft/ready state, approval state/counts, pipeline status, and
+merge conflicts are shown independently. Approval availability is kept separate
+from reviewer assignment. The UI is read-only in this first GitLab
 version; Included MR history, pending-review comments, and re-review markers
 are intentionally disabled.
 
@@ -76,27 +126,59 @@ make test
 make build
 ```
 
-The provider lives in `internal/gitlab`. It invokes `glab api --paginate`,
-deduplicates global MR IDs across the three relationship searches, hydrates
-MR details and approvals, and keeps a process-local project cache. The
-command runner is injectable so API fixtures can be tested without a token.
+Installer tests use a fake `glab` and local release fixtures; they never need
+GitLab credentials or a network download:
 
-Stack discovery is breadth-first and bounded to 500 MRs and 20 levels. A
-relationship is accepted only when the project ID and branch name both match;
-same-named branches in forks cannot create an edge.
+```sh
+bash scripts/install_test.sh
+pwsh -File scripts/install_test.ps1
+```
 
-For design decisions and data-flow limits, see [DESIGN.md](DESIGN.md).
+`GLAB_MR_GRAPH_ASSET_PATH` supplies the local fixture binary for these tests.
+
+The provider lives in `internal/gitlab`. It invokes `glab api` with manual
+`per_page=100&page=N` pagination, stops each search spec at 500 items, and
+deduplicates global MR IDs across the relationship searches. It hydrates MR
+details and approvals, keeps a process-local project cache with per-project
+singleflight, and bounds each
+refresh to a 2-minute context, 30-second requests, and 1,200 `glab`
+subprocesses. The command runner is injectable so API fixtures can be tested
+without a token.
+
+The server streams the list-derived stack topology first, with approvals marked
+as loading, and renders it immediately. It then hydrates all MR details and
+approvals with at most six workers and streams a complete status update. If a
+per-MR status request is unavailable or exhausts the refresh budget, the
+topology remains visible and the affected status is shown as unavailable.
+
+Stack discovery is breadth-first and bounded to 500 MRs and 20 levels. Branch
+lists request only the remaining MR capacity. Up to four search specs, branch
+queries in one breadth-first frontier, project metadata lookups, and the final
+MR hydration run with at most six workers; results and progress are applied in
+stable input order. A relationship is accepted only
+when the project ID and branch name both match; same-named branches in forks
+cannot create an edge.
+
+For design decisions and data-flow limits, see [DESIGN.md](DESIGN.md). For a
+GitHub-to-GitLab comparison and current implementation boundaries, see
+[docs/github-gitlab-differences.md](docs/github-gitlab-differences.md).
 
 ## Tracing
 
 Set `GLAB_MR_GRAPH_TRACE_OTEL=1` to export optional OpenTelemetry traces to
 `http://localhost:4318/v1/traces`. Set the variable to an explicit collector
 URL to use a different endpoint. Tracing is best effort and does not include
-API response bodies or tokens.
+API response bodies, tokens, search text, hostnames, API endpoints, command
+arguments, project/MR identifiers, or branch names. Span names and attributes
+are limited to fixed operation names, booleans, statuses, and counts. Failed
+spans export status code 2 with a fixed `error.type`; external error messages
+are excluded. The Go tests cover both recording-tracer redaction and the
+encoded OTLP payload.
 
 ## Releases
 
-GitHub Actions runs JavaScript checks, tests, vet, and cross-platform builds.
+GitHub Actions runs JavaScript checks, tests, vet, cross-platform builds, and
+installer tests on Ubuntu and Windows.
 User-facing changes are recorded under `Unreleased` in
 [CHANGELOG.md](CHANGELOG.md). Release preparation follows the upstream
 workflow and produces artifacts based on the `glab-mr-graph` binary name.

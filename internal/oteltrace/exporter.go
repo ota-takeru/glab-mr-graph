@@ -51,7 +51,7 @@ type spanData struct {
 	Kind                          SpanKind
 	Start, End                    time.Time
 	Attributes                    Attributes
-	Error                         string
+	Error                         bool
 }
 
 type recordingSpan struct {
@@ -112,7 +112,7 @@ func (s *recordingSpan) End(spanErr error, attributes Attributes) {
 			s.data.Attributes[key] = value
 		}
 		if spanErr != nil {
-			s.data.Error = spanErr.Error()
+			s.data.Error = true
 			s.data.Attributes["error.type"] = "_OTHER"
 		}
 		select {
@@ -179,8 +179,8 @@ func (e *Exporter) export(spans []spanData) {
 	encodedSpans := make([]any, 0, len(spans))
 	for _, s := range spans {
 		status := map[string]any{"code": 1}
-		if s.Error != "" {
-			status = map[string]any{"code": 2, "message": s.Error}
+		if s.Error {
+			status = map[string]any{"code": 2}
 		}
 		encodedSpan := map[string]any{
 			"traceId": s.TraceID, "spanId": s.SpanID, "name": s.Name, "kind": int(s.Kind),

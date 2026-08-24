@@ -34,6 +34,10 @@ type progressiveLoader interface {
 	LoadProgress(context.Context, graph.SearchOptions, func(current, total int, phase string, collected int)) (graph.Result, error)
 }
 
+type stagedLoader interface {
+	LoadStages(context.Context, graph.SearchOptions, func(current, total int, phase string, collected int), func(stage string, result graph.Result)) (graph.Result, error)
+}
+
 type includedLoader interface {
 	LoadIncluded(context.Context, []*graph.PullRequest, func(current, total int, phase string)) ([]graph.IncludedUpdate, error)
 }
@@ -117,7 +121,7 @@ func (s *Server) graph(w http.ResponseWriter, r *http.Request) {
 		ctx, span := s.tracer.Start(r.Context(), "GET /api/v1/graph", oteltrace.SpanServer, oteltrace.Attributes{
 			"http.request.method": "GET",
 			"http.route":          "/api/v1/graph",
-			"pr.search_query":     options.Query,
+			"pr.has_search_query": options.Query != "",
 		})
 		r = r.WithContext(ctx)
 		requestSpan = span
@@ -167,10 +171,32 @@ func (s *Server) graphStream(w http.ResponseWriter, r *http.Request, loader prog
 			flusher.Flush()
 		}
 	}
-	result, err := loader.LoadProgress(r.Context(), options, report)
+	emittedComplete := false
+	emit := func(stage string, result graph.Result) {
+		_ = encoder.Encode(map[string]any{"type": "result", "stage": stage, "result": result})
+		if stage == "complete" {
+			emittedComplete = true
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	var result graph.Result
+	var err error
+	if staged, ok := loader.(stagedLoader); ok {
+		result, err = staged.LoadStages(r.Context(), options, report, emit)
+	} else {
+		result, err = loader.LoadProgress(r.Context(), options, report)
+	}
 	if err != nil {
 		_ = encoder.Encode(map[string]any{"type": "error", "error": err.Error()})
+		if flusher != nil {
+			flusher.Flush()
+		}
 		return err
+	}
+	if emittedComplete {
+		return nil
 	}
 	collected := 0
 	for _, node := range result.Nodes {
@@ -179,7 +205,7 @@ func (s *Server) graphStream(w http.ResponseWriter, r *http.Request, loader prog
 		}
 	}
 	_ = encoder.Encode(map[string]any{"type": "progress", "current": 1, "total": 1, "phase": "Building merge request graph", "percent": 80, "collected": collected})
-	_ = encoder.Encode(map[string]any{"type": "result", "result": result})
+	emit("complete", result)
 	return nil
 }
 
@@ -209,7 +235,7 @@ func (s *Server) inspect(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	var span oteltrace.Span
 	if s.tracer != nil {
-		ctx, span = s.tracer.Start(ctx, "POST /api/v1/inspect", oteltrace.SpanServer, oteltrace.Attributes{"http.request.method": "POST", "http.route": "/api/v1/inspect", "pr.id": pr.ID})
+		ctx, span = s.tracer.Start(ctx, "POST /api/v1/inspect", oteltrace.SpanServer, oteltrace.Attributes{"http.request.method": "POST", "http.route": "/api/v1/inspect"})
 	}
 	update, err := loader.InspectPullRequest(ctx, &pr)
 	if span != nil {
@@ -249,7 +275,6 @@ func (s *Server) included(w http.ResponseWriter, r *http.Request) {
 			"http.request.method": "POST",
 			"http.route":          "/api/v1/included",
 			"pr.count":            len(request.PullRequests),
-			"pr.id":               request.PullRequests[0].ID,
 			"pr.included_count":   len(request.PullRequests[0].IncludedPRs),
 		})
 		r = r.WithContext(ctx)

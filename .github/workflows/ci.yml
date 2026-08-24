@@ -24,9 +24,19 @@ jobs:
         run: node --check internal/server/web/app.js
       - name: Test release notes
         run: bash .github/release-notes_test.sh
+      - name: Test POSIX installer
+        run: bash scripts/install_test.sh
       - name: Test
         run: go test ./...
       - name: Vet
         run: go vet ./...
       - name: Build
         run: go build -o glab-mr-graph ./cmd/glab-mr-graph
+
+  installer-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test PowerShell installer
+        shell: pwsh
+        run: ./scripts/install_test.ps1
